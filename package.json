@@ -10,7 +10,8 @@
   "scripts": {
     "typecheck": "tsc",
     "test": "node --test \"test/**/*.test.ts\"",
-    "duel": "node cli/duel.ts"
+    "duel": "node cli/duel.ts",
+    "view": "node cli/view.ts"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
