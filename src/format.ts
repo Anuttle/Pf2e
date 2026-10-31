@@ -25,7 +25,7 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     case "round":
       return ["", `Round ${event.round}`];
     case "turn-start":
-      return [`  ${name(event.creature)}'s turn (${event.actions} actions)`];
+      return [`  ${name(event.creature)}'s turn (${event.canAct ? `${event.actions} actions` : "can't act"})`];
     case "turn-end":
       return [];
     case "delay":
@@ -35,8 +35,10 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     case "delayed-turn-lost":
       return [`  ${name(event.creature)} Delayed a full round; that turn is lost`];
     case "action":
-      // Strikes print their own line; other actions are listed here.
-      return event.action.startsWith("Strike") ? [] : [`    ${name(event.creature)}: ${event.action}${event.reaction ? " (reaction)" : ""}`];
+      // Strikes and checks print their own lines; other actions are listed here.
+      return /^(Strike|Grapple|Trip|Escape)/.test(event.action)
+        ? []
+        : [`    ${name(event.creature)}: ${event.action}${event.reaction ? " (reaction)" : ""}`];
     case "move":
       return [];
     case "attack-roll": {
@@ -49,6 +51,37 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     }
     case "strike":
       return formatDamage(event.result);
+    case "skill-check": {
+      const c = event.check;
+      const mods = c.modifiers.map((m) => `${m.label} ${formatModifier(m.value)}${m.enabled ? "" : " (suppressed)"}`).join(", ");
+      return [
+        `    ${name(event.creature)} attempts to ${event.action} ${name(event.target)}: d20 ${c.die} ${formatModifier(c.modifier)} = ${c.total} vs DC ${c.dc} -> ${DEGREE_NAMES[c.degree]}`,
+        `      modifiers: ${mods}`,
+      ];
+    }
+    case "flat-check": {
+      const r = event.result;
+      return [`      flat check to ${event.purpose}: ${r.die ?? "auto"} vs DC ${r.dc} -> ${DEGREE_NAMES[r.degree]}`];
+    }
+    case "damage":
+      return [`      ${name(event.creature)} takes ${event.total} ${event.instances.map((i) => i.type).join("/")} damage (${event.source}); HP ${event.hp.before} -> ${event.hp.after}`];
+    case "action-lost":
+      return [`    ${name(event.creature)}'s ${event.action} is lost (${event.reason})`];
+    case "condition":
+      if (event.change === "lost") return [`      ${name(event.creature)} is no longer ${event.slug}`];
+      return [`      ${name(event.creature)} is ${event.slug}${event.value !== null ? ` ${event.value}` : ""}`];
+    case "recovery-check": {
+      const r = event.result;
+      return [`    ${name(event.creature)} recovery check: ${r.die} vs DC ${r.dc} -> ${DEGREE_NAMES[r.degree]}`];
+    }
+    case "knocked-out":
+      return [`    ${name(event.creature)} is knocked out${event.dying !== null ? ` (dying ${event.dying})` : ""}`];
+    case "hero-points":
+      return [`    ${name(event.creature)} spends ${event.spent} Hero Point(s) to stabilize at 0 HP`];
+    case "healed":
+      return [`    ${name(event.creature)} regains ${event.amount} HP; HP ${event.hp.before} -> ${event.hp.after}`];
+    case "death":
+      return [`    ${name(event.creature)} dies${event.reason === "massive-damage" ? " (massive damage)" : ""}`];
     case "reaction":
       return [`    ${name(event.creature)} reacts: ${event.label}`];
     case "disrupted":
@@ -65,7 +98,7 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     case "effect-end":
       return [`      ${event.name} ends (${event.reason})`];
     case "down":
-      return [`    ${name(event.creature)} drops to 0 HP${event.massiveDamage ? " (massive damage)" : ""}`];
+      return [];
     case "end":
       return [
         "",
@@ -104,6 +137,18 @@ function describeCommand(c: SingleCommand, name: (id: string) => string): string
       return `Interact (${c.description})`;
     case "sustain":
       return "Sustain";
+    case "crawl":
+      return `a Crawl to ${c.to} ft`;
+    case "stand":
+      return "Stand";
+    case "drop-prone":
+      return "Drop Prone";
+    case "grapple":
+      return `a Grapple against ${name(c.target)}`;
+    case "trip":
+      return `a Trip against ${name(c.target)}`;
+    case "escape":
+      return `an Escape from ${name(c.from)}`;
   }
 }
 

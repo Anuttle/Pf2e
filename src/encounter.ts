@@ -1,33 +1,56 @@
 // Encounter engine: initiative, rounds, the three-action turn, reactions,
-// effect durations, Delay and Ready.
+// effect durations, conditions, dying, Delay and Ready.
 // https://2e.aonprd.com/Rules.aspx?ID=2421 (Encounter Mode)
 // https://2e.aonprd.com/Rules.aspx?ID=2427 (Turns)
 // https://2e.aonprd.com/Rules.aspx?ID=2335 (Actions)
+// https://2e.aonprd.com/Rules.aspx?ID=2319 (Hit Points, Healing, and Dying)
 //
 // Creatures are driven by Controllers. The engine asks a controller for each
 // action on its turn and offers it reactions as triggers happen, so every
 // decision point is explicit and the same seed replays the same encounter.
 
-import { type CheckResult, CRITICAL_SUCCESS, rollCheck, succeeded } from "./check.ts";
-import type { Creature, ReactionSlug, StrikeProfile } from "./creature.ts";
-import { type DamageType, PHYSICAL_TYPES, applyDefenses } from "./damage.ts";
-import { type Rng, createRng } from "./dice.ts";
+import {
+  type CheckResult,
+  CRITICAL_FAILURE,
+  CRITICAL_SUCCESS,
+  type Degree,
+  FAILURE,
+  type FlatCheckResult,
+  SUCCESS,
+  flatCheck,
+  rollCheck,
+  succeeded,
+} from "./check.ts";
+import {
+  type Condition,
+  type ConditionSlug,
+  type RollContext,
+  type Skill,
+  conditionModifiers,
+  conditionValue,
+  hasCondition,
+  resolveConditions,
+} from "./conditions.ts";
+import type { Creature, ReactionSlug, SaveType, StrikeProfile } from "./creature.ts";
+import { type DamageInstance, type DamageType, PHYSICAL_TYPES, applyDefenses } from "./damage.ts";
+import { type Rng, createRng, rollDice, sum } from "./dice.ts";
 import {
   type Duration,
   type Effect,
   type EffectEndReason,
   type EffectModifier,
+  type Selector,
   modifiersFrom,
   tickTurnEnd,
   tickTurnStart,
 } from "./effects.ts";
-import type { Modifier } from "./modifiers.ts";
+import { type Modifier, stackModifiers } from "./modifiers.ts";
 import { type ShieldBlockResult, isBroken, shieldBlock } from "./shields.ts";
 import { LineSpace, SQUARE } from "./space.ts";
 import {
+  type HpChange,
   type StrikeResult,
   applyDamage,
-  armorClass,
   multipleAttackPenalty,
   rangePenalty,
   rollStrikeDamage,
@@ -42,9 +65,16 @@ export type SingleCommand =
   | { action: "strike"; target: string; strike?: number }
   | { action: "stride"; to: number }
   | { action: "step"; to: number }
+  | { action: "crawl"; to: number }
+  | { action: "stand" }
+  | { action: "drop-prone" }
   | { action: "raise-shield" }
   | { action: "interact"; description: string }
-  | { action: "sustain"; effect: string };
+  | { action: "sustain"; effect: string }
+  | { action: "grapple"; target: string }
+  | { action: "trip"; target: string }
+  /** Escape whatever grab, restraint or immobilization `from` is imposing. */
+  | { action: "escape"; from: string };
 
 export type ReadyTrigger =
   | { kind: "enemy-enters-reach" }
@@ -61,7 +91,7 @@ interface ActionInfo {
   traits: readonly string[];
 }
 
-// https://2e.aonprd.com/Rules.aspx?ID=2343 (Basic Actions)
+// https://2e.aonprd.com/Rules.aspx?ID=2343 (Basic Actions), Athletics actions on https://2e.aonprd.com/Skills.aspx?ID=36
 function actionInfo(actor: Creature, command: Command): ActionInfo {
   switch (command.action) {
     case "strike": {
@@ -72,12 +102,24 @@ function actionInfo(actor: Creature, command: Command): ActionInfo {
       return { name: "Stride", cost: 1, traits: ["move"] };
     case "step":
       return { name: "Step", cost: 1, traits: ["move"] };
+    case "crawl":
+      return { name: "Crawl", cost: 1, traits: ["move"] };
+    case "stand":
+      return { name: "Stand", cost: 1, traits: ["move"] };
+    case "drop-prone":
+      return { name: "Drop Prone", cost: 1, traits: ["move"] };
     case "raise-shield":
       return { name: "Raise a Shield", cost: 1, traits: [] };
     case "interact":
       return { name: `Interact (${command.description})`, cost: 1, traits: ["manipulate"] };
     case "sustain":
       return { name: "Sustain", cost: 1, traits: ["concentrate"] };
+    case "grapple":
+      return { name: "Grapple", cost: 1, traits: ["attack"] };
+    case "trip":
+      return { name: "Trip", cost: 1, traits: ["attack"] };
+    case "escape":
+      return { name: "Escape", cost: 1, traits: ["attack"] };
     case "ready":
       return { name: "Ready", cost: 2, traits: ["concentrate"] };
     case "end-turn":
@@ -125,6 +167,11 @@ export interface Controller {
   delayTurn?(encounter: Encounter, actor: string): boolean;
   /** At the end of another creature's turn, while Delayed: return now? */
   returnFromDelay?(encounter: Encounter, actor: string, after: string): boolean;
+  /**
+   * The creature's dying value would rise to `to`. Spend all Hero Points to
+   * stabilize at 0 HP instead? https://2e.aonprd.com/Rules.aspx?ID=2333
+   */
+  spendHeroPoints?(encounter: Encounter, actor: string, to: number): boolean;
 }
 
 interface Readied {
@@ -147,24 +194,36 @@ export interface InitiativeEntry {
 export type EncounterEvent =
   | { kind: "initiative"; order: InitiativeEntry[] }
   | { kind: "round"; round: number }
-  | { kind: "turn-start"; round: number; creature: string; actions: number }
+  | { kind: "turn-start"; round: number; creature: string; actions: number; canAct: boolean }
   | { kind: "turn-end"; creature: string }
   | { kind: "delay"; creature: string }
   | { kind: "return"; creature: string; after: string }
   | { kind: "delayed-turn-lost"; creature: string }
   | { kind: "action"; creature: string; action: string; cost: number; traits: readonly string[]; reaction: boolean }
-  | { kind: "move"; creature: string; from: number; to: number; action: "stride" | "step" }
+  | { kind: "move"; creature: string; from: number; to: number; action: "stride" | "step" | "crawl" }
+  /** A flat check: to target a concealed or hidden creature, to act while grabbed, to end persistent damage. */
+  | { kind: "flat-check"; creature: string; purpose: string; result: FlatCheckResult }
   /** The attack roll, logged before any reactions to the hit. */
   | { kind: "attack-roll"; attacker: string; target: string; weapon: string; check: CheckResult; reaction: boolean }
   /** The whole Strike once damage (if any) is applied. */
   | { kind: "strike"; result: StrikeResult; reaction: boolean }
+  | { kind: "skill-check"; creature: string; action: string; target: string; check: CheckResult }
+  | { kind: "damage"; creature: string; source: string; instances: DamageInstance[]; total: number; hp: HpChange }
   | { kind: "reaction"; creature: string; reaction: ReactionOption["reaction"]; label: string; trigger: Trigger["kind"] }
   | { kind: "disrupted"; creature: string; action: string }
+  | { kind: "action-lost"; creature: string; action: string; reason: string }
   | { kind: "shield-block"; creature: string; result: ShieldBlockResult }
   | { kind: "ready"; creature: string; readied: SingleCommand; trigger: ReadyTrigger }
   | { kind: "effect-start"; effect: string; name: string; target: string }
   | { kind: "effect-end"; effect: string; name: string; target: string; reason: EffectEndReason }
-  | { kind: "down"; creature: string; massiveDamage: boolean }
+  | { kind: "condition"; creature: string; slug: ConditionSlug; value: number | null; change: "gained" | "changed" | "lost" }
+  | { kind: "recovery-check"; creature: string; dc: number; result: FlatCheckResult; dying: number }
+  | { kind: "knocked-out"; creature: string; dying: number | null }
+  | { kind: "hero-points"; creature: string; spent: number }
+  | { kind: "healed"; creature: string; amount: number; hp: { before: number; after: number } }
+  | { kind: "death"; creature: string; reason: "dying" | "massive-damage" | "zero-hp" }
+  /** The creature is out of the fight: unconscious or dead. */
+  | { kind: "down"; creature: string }
   | { kind: "end"; winner: Creature["side"] | null; rounds: number };
 
 // ---------------------------------------------------------------------------
@@ -176,11 +235,15 @@ export type EncounterEvent =
  * modifier, then a seeded coin flip.
  * https://2e.aonprd.com/Rules.aspx?ID=2423
  */
-export function rollInitiative(rng: Rng, creatures: readonly Creature[]): InitiativeEntry[] {
+export function rollInitiative(
+  rng: Rng,
+  creatures: readonly Creature[],
+  extraModifiers: (c: Creature) => readonly Modifier[] = () => [],
+): InitiativeEntry[] {
   const entries = creatures.map((c) => ({
     creature: c,
     // Initiative results are ranked, not compared to a DC; the DC here is unused.
-    roll: rollCheck(rng, c.perception, 0),
+    roll: rollCheck(rng, [...c.perception, ...extraModifiers(c)], 0),
     tiebreak: rng.next(),
   }));
   entries.sort((a, b) => {
@@ -226,6 +289,7 @@ export interface EncounterResult {
 }
 
 const RAISED_SHIELD_TAG = "shield-raised";
+const GRAPPLE_TAG = "grapple";
 
 export class Encounter {
   readonly seed: number;
@@ -245,6 +309,10 @@ export class Encounter {
   private readonly reactionAvailable = new Map<string, boolean>();
   private readonly delayed = new Set<string>();
   private readonly readied = new Map<string, Readied>();
+  /** Creatures that critically failed to Escape and can't try again until their next turn. */
+  private readonly escapeBarred = new Set<string>();
+  /** Turn number whose persistent damage and frightened decrease already happened (a Delay does them early). */
+  private readonly endOfTurnDone = new Map<string, number>();
   private readonly maxRounds: number;
   private readonly fixedInitiative: readonly string[] | undefined;
   private nextEffectId = 1;
@@ -277,9 +345,27 @@ export class Encounter {
     return [...this.creatures.values()];
   }
 
+  /** Enemies still in the fight (not dead or unconscious). */
   foes(id: string): Creature[] {
     const side = this.creature(id).side;
     return this.all().filter((c) => c.side !== side && !c.down);
+  }
+
+  /** Every condition the creature has right now, from all sources, with implied ones added. */
+  conditions(id: string): Condition[] {
+    const c = this.creature(id);
+    const granted = this.effects.filter((e) => e.target === id).flatMap((e) => e.conditions);
+    return resolveConditions([...c.conditions, ...granted]);
+  }
+
+  has(id: string, slug: ConditionSlug, other?: string): boolean {
+    return hasCondition(this.conditions(id), slug, other);
+  }
+
+  /** Unconscious, stunned and dead creatures can't act, including reactions. */
+  canAct(id: string): boolean {
+    const c = this.creature(id);
+    return !c.dead && !this.has(id, "unconscious") && !this.has(id, "stunned");
   }
 
   isDelayed(id: string): boolean {
@@ -287,7 +373,7 @@ export class Encounter {
   }
 
   hasReaction(id: string): boolean {
-    return this.reactionAvailable.get(id) === true && !this.delayed.has(id) && !this.creature(id).down;
+    return this.reactionAvailable.get(id) === true && !this.delayed.has(id) && this.canAct(id);
   }
 
   readiedAction(id: string): Readied | undefined {
@@ -309,24 +395,75 @@ export class Encounter {
     return profile ? { index, profile } : null;
   }
 
+  /** Modifiers on one of a creature's rolls or DCs from effects and conditions. */
+  situational(id: string, selector: Selector | null, ctx: RollContext, other?: string): Modifier[] {
+    return [...(selector ? modifiersFrom(this.effects, id, selector) : []), ...conditionModifiers(this.conditions(id), ctx, other)];
+  }
+
+  skillModifiers(id: string, skill: Skill, other?: string): Modifier[] {
+    const c = this.creature(id);
+    return [...(c.skills[skill] ?? []), ...this.situational(id, null, { kind: "skill", skill }, other)];
+  }
+
+  skillDC(id: string, skill: Skill, other?: string): number {
+    const c = this.creature(id);
+    return 10 + stackModifiers([...(c.skills[skill] ?? []), ...this.situational(id, null, { kind: "skill", skill, dc: true }, other)]).total;
+  }
+
+  saveDC(id: string, save: SaveType, other?: string): number {
+    const c = this.creature(id);
+    return 10 + stackModifiers([...c.saves[save], ...this.situational(id, save, { kind: "save", save, dc: true }, other)]).total;
+  }
+
+  /** AC against `attacker`: off-guard to it if the attacker is hidden from the target. */
+  armorClass(targetId: string, attackerId: string): number {
+    const target = this.creature(targetId);
+    const mods = [...target.ac, ...this.situational(targetId, "ac", { kind: "ac" }, attackerId)];
+    if (this.hiddenFrom(attackerId, targetId)) mods.push({ label: "off-guard (attacker hidden)", type: "circumstance", value: -2 });
+    return 10 + stackModifiers(mods).total;
+  }
+
+  /** Is `subject` hidden from `observer`? Everything is hidden from a blinded creature. */
+  hiddenFrom(subject: string, observer: string): boolean {
+    return this.has(subject, "hidden", observer) || this.has(observer, "blinded");
+  }
+
+  /** Is `subject` concealed from `observer`? Everything is concealed from a dazzled creature. */
+  concealedFrom(subject: string, observer: string): boolean {
+    return this.has(subject, "concealed", observer) || this.has(observer, "dazzled");
+  }
+
   /** Why this command is illegal for `actor` right now, or null if it's legal. */
   illegal(actorId: string, command: Command, asReaction = false): string | null {
     const actor = this.creature(actorId);
-    if (actor.down) return "creature is down";
+    if (!this.canAct(actorId)) return "creature can't act";
     if (!asReaction) {
       if (!this.turn || this.turn.creature !== actorId || this.turn.ended) return "not this creature's turn";
       const cost = actionInfo(actor, command).cost;
       if (cost > this.turn.actions) return `needs ${cost} action(s), ${this.turn.actions} left`;
     }
+    if (command.action === "end-turn") return asReaction ? "can't end a turn as a reaction" : null;
+
+    const traits = actionInfo(actor, command).traits;
+    const prone = this.has(actorId, "prone");
+    if (traits.includes("move")) {
+      // https://2e.aonprd.com/Conditions.aspx?ID=81
+      if (this.has(actorId, "immobilized")) return "immobilized: can't use move actions";
+      // https://2e.aonprd.com/Conditions.aspx?ID=88
+      if (prone && command.action !== "crawl" && command.action !== "stand") return "prone: the only move actions are Crawl and Stand";
+    }
+    // https://2e.aonprd.com/Conditions.aspx?ID=90
+    if (this.has(actorId, "restrained") && (traits.includes("attack") || traits.includes("manipulate")) && command.action !== "escape") {
+      return "restrained: no attack or manipulate actions except Escape";
+    }
+
     switch (command.action) {
-      case "end-turn":
-        return asReaction ? "can't end a turn as a reaction" : null;
       case "strike": {
         const profile = actor.strikes[command.strike ?? 0];
         if (!profile) return "no such strike";
         if (command.target === "trigger") return asReaction ? null : "only a readied Strike can target the trigger";
-        const target = this.creatures.get(command.target);
-        if (!target || target.down || target.id === actorId) return "invalid target";
+        const target = this.validTarget(actorId, command.target);
+        if (typeof target === "string") return target;
         const distance = this.space.distance(actorId, target.id);
         if (profile.range === "melee") {
           return distance <= this.reachWith(actor, profile) ? null : "target out of reach";
@@ -345,11 +482,18 @@ export class Encounter {
         }
         return this.standingAt(command.to).length ? "destination is occupied" : null;
       }
-      case "step": {
-        if (actor.speed < 10) return "Step requires a Speed of at least 10 feet";
-        if (Math.abs(command.to - this.space.position(actorId)) !== SQUARE) return "Step moves exactly 5 feet";
+      case "step":
+      case "crawl": {
+        // https://2e.aonprd.com/Actions.aspx?ID=2304, https://2e.aonprd.com/Actions.aspx?ID=2293
+        if (actor.speed < 10) return `${command.action === "step" ? "Step" : "Crawl"} requires a Speed of at least 10 feet`;
+        if (command.action === "crawl" && !prone) return "Crawl requires being prone";
+        if (Math.abs(command.to - this.space.position(actorId)) !== SQUARE) return "moves exactly 5 feet";
         return this.standingAt(command.to).length ? "destination is occupied" : null;
       }
+      case "stand":
+        return prone ? null : "not prone";
+      case "drop-prone":
+        return prone ? "already prone" : null;
       case "raise-shield":
         if (!actor.shield) return "not wielding a shield";
         if (isBroken(actor.shield)) return "shield is broken";
@@ -361,12 +505,34 @@ export class Encounter {
         if (!effect || effect.source !== actorId || effect.duration.kind !== "sustained") return "no sustained effect to Sustain";
         return null;
       }
+      case "grapple":
+      case "trip": {
+        // https://2e.aonprd.com/Actions.aspx?ID=35 (Grapple), https://2e.aonprd.com/Actions.aspx?ID=2382 (Trip)
+        // Size limits (no more than one size larger) aren't checked yet.
+        const target = this.validTarget(actorId, command.target);
+        if (typeof target === "string") return target;
+        if (this.space.distance(actorId, target.id) > actor.reach) return "target out of reach";
+        const holding = command.action === "grapple" && this.grappleEffects(actorId, target.id).length > 0;
+        return actor.freeHands > 0 || holding ? null : "needs a free hand";
+      }
+      case "escape": {
+        // https://2e.aonprd.com/Actions.aspx?ID=2296
+        if (this.escapeBarred.has(actorId)) return "critically failed to Escape; can't try again until next turn";
+        const { effects, direct } = this.restraintsFrom(actorId, command.from);
+        return effects.length + direct.length ? null : `nothing from ${command.from} to Escape`;
+      }
       case "ready": {
         if (asReaction) return "can't Ready as a reaction";
         const cost = actionInfo(actor, command.readied).cost;
         return cost === 1 ? null : "Ready holds a single action";
       }
     }
+  }
+
+  private validTarget(actorId: string, targetId: string): Creature | string {
+    const target = this.creatures.get(targetId);
+    if (!target || target.dead || target.id === actorId) return "invalid target";
+    return target;
   }
 
   // ---- running the encounter ----------------------------------------------
@@ -381,9 +547,10 @@ export class Encounter {
   start(): void {
     const initiative = this.fixedInitiative
       ? this.fixedInitiative.map((id) => ({ id: this.creature(id).id, roll: null, tiebreak: 0 }))
-      : rollInitiative(this.rng, this.all());
+      : rollInitiative(this.rng, this.all(), (c) => this.situational(c.id, "perception", { kind: "perception" }));
     this.order = initiative.map((e) => e.id);
     this.emit({ kind: "initiative", order: initiative });
+    for (const c of this.all()) this.refreshDown(c);
   }
 
   playRound(): void {
@@ -400,7 +567,8 @@ export class Encounter {
   /** Run the turn at `id`'s place in the order. Returns the last creature that acted. */
   private takeSlot(id: string): string {
     const creature = this.creature(id);
-    if (creature.down) return id;
+    // Dead creatures have no turns; unconscious ones still do (recovery checks).
+    if (creature.dead) return id;
 
     if (this.delayed.has(id)) {
       // Delayed a whole round: that turn's actions are lost, and the next turn
@@ -421,40 +589,82 @@ export class Encounter {
     this.turnCounts.set(id, number);
     for (const effect of tickTurnStart(this.effects, id, number)) this.endEffect(effect, "expired");
     this.readied.delete(id);
+    this.escapeBarred.delete(id);
+
+    // https://2e.aonprd.com/Rules.aspx?ID=2326 (Recovery Checks)
+    if (this.has(id, "dying")) {
+      this.recoveryCheck(this.creature(id));
+      if (this.finished || this.creature(id).dead) return false;
+    }
 
     const controller = this.controllers.get(id)!;
-    if (controller.delayTurn?.(this, id)) {
+    if (this.canAct(id) && controller.delayTurn?.(this, id)) {
       this.delayed.add(id);
       this.emit({ kind: "delay", creature: id });
       // Negative effects at the end of the turn happen now, and beneficial
       // effects that would end during the turn end now.
-      this.endOfTurnEffects(id, number);
+      this.endOfTurn(id, number);
       return true;
     }
     return false;
   }
 
+  /**
+   * Regain 3 actions (+1 quickened) and 1 reaction, minus actions lost to
+   * stunned and slowed. Stunned overrides slowed, and actions lost to stunned
+   * count toward those lost to slowed.
+   * https://2e.aonprd.com/Conditions.aspx?ID=89, ID=92, ID=93
+   */
+  private regainActions(id: string): number {
+    const c = this.creature(id);
+    const conditions = this.conditions(id);
+    const available = 3 + (hasCondition(conditions, "quickened") ? 1 : 0);
+    const stunned = conditions.find((x) => x.slug === "stunned");
+    if (stunned && stunned.value === undefined) return 0; // stunned for a duration: lose every action
+    let lostToStunned = 0;
+    if (stunned?.value) {
+      lostToStunned = Math.min(stunned.value, available);
+      const direct = c.conditions.find((x) => x.slug === "stunned");
+      if (direct?.value !== undefined) this.setCondition(c, "stunned", direct.value - lostToStunned);
+    }
+    const lost = Math.min(available, Math.max(lostToStunned, conditionValue(conditions, "slowed")));
+    return available - lost;
+  }
+
   private playTurn(id: string): void {
     const number = this.turnCounts.get(id) ?? 1;
-    // Regain 3 actions and 1 reaction; an unspent reaction from last turn is lost.
-    // Slowed, stunned and quickened will adjust this in milestone 4.
-    this.turn = { creature: id, number, actions: 3, attacks: 0, ended: false };
+    const actions = this.regainActions(id);
+    // An unspent reaction from last turn is lost; the new one comes back now.
+    this.turn = { creature: id, number, actions, attacks: 0, ended: false };
     this.reactionAvailable.set(id, true);
-    this.emit({ kind: "turn-start", round: this.round, creature: id, actions: 3 });
+    const canAct = this.canAct(id);
+    this.emit({ kind: "turn-start", round: this.round, creature: id, actions, canAct });
 
     const controller = this.controllers.get(id)!;
-    while (!this.finished && !this.creature(id).down && this.turn.actions > 0 && !this.turn.ended) {
-      const command = controller.chooseAction(this, id);
-      this.act(command);
+    while (!this.finished && this.canAct(id) && this.turn.actions > 0 && !this.turn.ended) {
+      this.act(controller.chooseAction(this, id));
     }
 
-    this.endOfTurnEffects(id, number);
+    if (!this.finished) this.endOfTurn(id, number);
     this.emit({ kind: "turn-end", creature: id });
     this.turn = null;
   }
 
-  private endOfTurnEffects(id: string, number: number): void {
+  /**
+   * End of turn: effects that end now, then persistent damage and its flat
+   * checks, then conditions like frightened go down.
+   * https://2e.aonprd.com/Rules.aspx?ID=2430
+   */
+  private endOfTurn(id: string, number: number): void {
     for (const { effect, reason } of tickTurnEnd(this.effects, id, number)) this.endEffect(effect, reason);
+    const c = this.creature(id);
+    // A Delayed turn already took its end-of-turn damage when it Delayed.
+    if (c.dead || this.endOfTurnDone.get(id) === number) return;
+    this.endOfTurnDone.set(id, number);
+    this.persistentDamage(c);
+    if (this.finished || c.dead) return;
+    const frightened = c.conditions.find((x) => x.slug === "frightened");
+    if (frightened?.value) this.setCondition(c, "frightened", frightened.value - 1);
   }
 
   /** After `after` ends its turn, Delayed creatures may return, in initiative order. */
@@ -462,7 +672,7 @@ export class Encounter {
     let last = after;
     for (;;) {
       const returning = this.order.find(
-        (d) => this.delayed.has(d) && !this.creature(d).down && this.controllers.get(d)!.returnFromDelay?.(this, d, last),
+        (d) => this.delayed.has(d) && this.canAct(d) && this.controllers.get(d)!.returnFromDelay?.(this, d, last),
       );
       if (!returning || this.finished) return last;
       this.delayed.delete(returning);
@@ -517,13 +727,25 @@ export class Encounter {
     const isAttack = info.traits.includes("attack");
     const priorAttacks = this.turn?.creature === actor.id ? this.turn.attacks : 0;
     if (isAttack && !options.reaction && this.turn) this.turn.attacks += 1;
+    const map = options.map ?? (options.reaction ? 0 : multipleAttackPenalty(priorAttacks, this.mapTraits(actor, command)));
 
-    // Stepping doesn't trigger reactions that respond to move actions.
+    // Grabbed: a manipulate action needs a DC 5 flat check after it's spent, before any effects.
+    // https://2e.aonprd.com/Conditions.aspx?ID=77
+    if (info.traits.includes("manipulate") && this.has(actor.id, "grabbed")) {
+      const result = flatCheck(this.rng, 5);
+      this.emit({ kind: "flat-check", creature: actor.id, purpose: `${info.name} while grabbed`, result });
+      if (!succeeded(result.degree)) {
+        this.emit({ kind: "action-lost", creature: actor.id, action: info.name, reason: "grabbed" });
+        return;
+      }
+    }
+
+    // Step doesn't trigger reactions to move actions; Crawl does.
     if (command.action !== "step") {
       const ranged = command.action === "strike" && actor.strikes[command.strike ?? 0]?.range === "ranged";
       this.offerReactions({ kind: "action", actor: actor.id, action: info.name, traits: info.traits, ranged, context });
     }
-    if (this.finished || actor.down) return;
+    if (this.finished || !this.canAct(actor.id)) return;
     if (context.disrupted) {
       this.emit({ kind: "disrupted", creature: actor.id, action: info.name });
       return;
@@ -534,15 +756,18 @@ export class Encounter {
         const profile = actor.strikes[command.strike ?? 0]!;
         const targetId = command.target === "trigger" ? options.triggeredBy : command.target;
         const target = targetId ? this.creatures.get(targetId) : undefined;
-        if (!target || target.down) return;
-        const map = options.map ?? (options.reaction ? 0 : multipleAttackPenalty(priorAttacks, profile.traits));
+        if (!target || target.dead) return;
         this.resolveStrike(actor, target, profile, map, options.reaction);
         return;
       }
       case "stride":
-        return this.move(actor, command.to, "stride");
       case "step":
-        return this.move(actor, command.to, "step");
+      case "crawl":
+        return this.move(actor, command.to, command.action);
+      case "stand":
+        return this.removeCondition(actor, "prone");
+      case "drop-prone":
+        return this.addCondition(actor.id, { slug: "prone" });
       case "raise-shield": {
         const shield = actor.shield!;
         this.addEffect({
@@ -563,11 +788,18 @@ export class Encounter {
         if (effect && effect.duration.kind === "sustained") effect.duration.expiresAfterTurn = turnNumber + 1;
         return;
       }
+      case "grapple":
+        return this.grapple(actor, this.creature(command.target), map);
+      case "trip":
+        return this.trip(actor, this.creature(command.target), map);
+      case "escape":
+        return this.escape(actor, this.creature(command.from), map);
       case "ready": {
         const readied = command.readied;
-        const profile = readied.action === "strike" ? actor.strikes[readied.strike ?? 0] : undefined;
-        const map = profile ? multipleAttackPenalty(priorAttacks, profile.traits) : 0;
-        this.readied.set(actor.id, { command: readied, trigger: command.trigger, map });
+        const readiedMap = actionInfo(actor, readied).traits.includes("attack")
+          ? multipleAttackPenalty(priorAttacks, this.mapTraits(actor, readied))
+          : 0;
+        this.readied.set(actor.id, { command: readied, trigger: command.trigger, map: readiedMap });
         this.emit({ kind: "ready", creature: actor.id, readied, trigger: command.trigger });
         // "Your turn then ends."
         if (this.turn?.creature === actor.id) this.turn.ended = true;
@@ -578,32 +810,56 @@ export class Encounter {
     }
   }
 
+  /** Weapon traits that set the multiple attack penalty (agile); skill actions have none. */
+  private mapTraits(actor: Creature, command: Command): readonly string[] {
+    return command.action === "strike" ? (actor.strikes[command.strike ?? 0]?.traits ?? []) : [];
+  }
+
   /** Move square by square so reactions can respond to each square left or entered. */
-  private move(actor: Creature, to: number, kind: "stride" | "step"): void {
+  private move(actor: Creature, to: number, kind: "stride" | "step" | "crawl"): void {
+    // A Grapple holds only "unless you move".
+    for (const e of this.effects.filter((e) => e.source === actor.id && e.tags.includes(GRAPPLE_TAG))) this.endEffect(e, "removed");
+    const triggers = kind !== "step";
     for (const square of LineSpace.path(this.space.position(actor.id), to)) {
       const from = this.space.position(actor.id);
-      if (kind === "stride") {
+      if (triggers) {
         this.offerReactions({ kind: "leave-square", actor: actor.id, from, to: square });
-        if (this.finished || actor.down) return;
+        if (this.finished || !this.canAct(actor.id)) return;
       }
       this.space.place(actor.id, square);
       this.emit({ kind: "move", creature: actor.id, from, to: square, action: kind });
-      if (kind === "stride") {
+      if (triggers) {
         this.offerReactions({ kind: "enter-square", actor: actor.id, at: square });
-        if (this.finished || actor.down) return;
+        if (this.finished || !this.canAct(actor.id)) return;
       }
     }
   }
 
-  private resolveStrike(attacker: Creature, target: Creature, profile: StrikeProfile, map: number, reaction: boolean): StrikeResult {
-    const modifiers: Modifier[] = [...profile.attack, ...modifiersFrom(this.effects, attacker.id, "attack")];
+  /**
+   * Targeting a concealed creature takes a DC 5 flat check, a hidden one DC 11.
+   * If both could apply, roll once against the higher DC.
+   * https://2e.aonprd.com/Conditions.aspx?ID=62, ID=79; https://2e.aonprd.com/Rules.aspx?ID=2278
+   */
+  private targetingCheck(attacker: Creature, target: Creature): boolean {
+    const dc = this.hiddenFrom(target.id, attacker.id) ? 11 : this.concealedFrom(target.id, attacker.id) ? 5 : 0;
+    if (!dc) return true;
+    const result = flatCheck(this.rng, dc);
+    this.emit({ kind: "flat-check", creature: attacker.id, purpose: `target ${target.name} (${dc === 11 ? "hidden" : "concealed"})`, result });
+    return succeeded(result.degree);
+  }
+
+  private resolveStrike(attacker: Creature, target: Creature, profile: StrikeProfile, map: number, reaction: boolean): StrikeResult | null {
+    if (!this.targetingCheck(attacker, target)) return null;
+    const modifiers: Modifier[] = [
+      ...profile.attack,
+      ...this.situational(attacker.id, "attack", { kind: "attack", attribute: profile.attackAttribute, range: profile.range }, target.id),
+    ];
     if (map !== 0) modifiers.push({ label: "multiple attack penalty", type: "untyped", value: map });
     if (profile.range === "ranged" && profile.rangeIncrement) {
       const penalty = rangePenalty(this.space.distance(attacker.id, target.id), profile.rangeIncrement) ?? 0;
       if (penalty !== 0) modifiers.push({ label: "range penalty", type: "untyped", value: penalty });
     }
-    const dc = armorClass(target, modifiersFrom(this.effects, target.id, "ac"));
-    const check = rollCheck(this.rng, modifiers, dc);
+    const check = rollCheck(this.rng, modifiers, this.armorClass(target.id, attacker.id));
     const base = { attacker: attacker.id, target: target.id, weapon: profile.name, map, check };
     this.emit({ kind: "attack-roll", attacker: attacker.id, target: target.id, weapon: profile.name, check, reaction });
 
@@ -615,7 +871,13 @@ export class Encounter {
 
     const damageProfile: StrikeProfile = {
       ...profile,
-      damage: { ...profile.damage, modifiers: [...profile.damage.modifiers, ...modifiersFrom(this.effects, attacker.id, "damage")] },
+      damage: {
+        ...profile.damage,
+        modifiers: [
+          ...profile.damage.modifiers,
+          ...this.situational(attacker.id, "damage", { kind: "damage", attribute: profile.damageAttribute }, target.id),
+        ],
+      },
     };
     const damage = rollStrikeDamage(this.rng, damageProfile, check.degree);
     const defended = applyDefenses([{ type: profile.damage.type, amount: damage.total }], target.defenses);
@@ -628,11 +890,315 @@ export class Encounter {
     const hp = applyDamage(target, pending.amount);
     const result: StrikeResult = { ...base, damage, defended, hp, ...(pending.block ? { shieldBlock: pending.block } : {}) };
     this.emit({ kind: "strike", result, reaction });
-    if (target.down) {
-      this.emit({ kind: "down", creature: target.id, massiveDamage: hp.massiveDamage });
+    this.afterDamage(target, hp, pending.amount, {
+      critical: check.degree === CRITICAL_SUCCESS,
+      nonlethal: profile.traits.includes("nonlethal"),
+    });
+    return result;
+  }
+
+  // ---- Athletics actions --------------------------------------------------
+
+  private athleticsCheck(actor: Creature, target: Creature, action: string, dc: number, map: number): Degree | null {
+    if (!this.targetingCheck(actor, target)) return null;
+    const mods = [...this.skillModifiers(actor.id, "athletics", target.id)];
+    if (map !== 0) mods.push({ label: "multiple attack penalty", type: "untyped", value: map });
+    const check = rollCheck(this.rng, mods, dc);
+    this.emit({ kind: "skill-check", creature: actor.id, action, target: target.id, check });
+    return check.degree;
+  }
+
+  private grappleEffects(grabber: string, target: string): Effect[] {
+    return this.effects.filter((e) => e.source === grabber && e.target === target && e.tags.includes(GRAPPLE_TAG));
+  }
+
+  /** https://2e.aonprd.com/Actions.aspx?ID=35 (Player Core pg. 235) */
+  private grapple(actor: Creature, target: Creature, map: number): void {
+    const degree = this.athleticsCheck(actor, target, "Grapple", this.saveDC(target.id, "fortitude", actor.id), map);
+    if (degree === null) return;
+    const existing = this.grappleEffects(actor.id, target.id);
+    if (degree >= SUCCESS) {
+      for (const e of existing) this.endEffect(e, "removed");
+      const slug = degree === CRITICAL_SUCCESS ? "restrained" : "grabbed";
+      // "Until the end of your next turn": counted from the end of this turn if it's yours.
+      const remaining = this.turn?.creature === actor.id ? 2 : 1;
+      this.addEffect({
+        name: `${slug} by ${actor.name}`,
+        source: actor.id,
+        target: target.id,
+        duration: { kind: "turns", remaining, of: actor.id },
+        conditions: [{ slug, source: actor.id }],
+        tags: [GRAPPLE_TAG],
+      });
+    } else {
+      for (const e of existing) this.endEffect(e, "removed");
+      // Critical failure: the target breaks free and may grab you or knock you prone; the engine knocks you prone.
+      if (degree === CRITICAL_FAILURE) this.addCondition(actor.id, { slug: "prone" });
+    }
+  }
+
+  /** https://2e.aonprd.com/Actions.aspx?ID=2382 (Player Core pg. 236) */
+  private trip(actor: Creature, target: Creature, map: number): void {
+    const degree = this.athleticsCheck(actor, target, "Trip", this.saveDC(target.id, "reflex", actor.id), map);
+    if (degree === null) return;
+    if (degree >= SUCCESS) {
+      this.addCondition(target.id, { slug: "prone" });
+      if (degree === CRITICAL_SUCCESS) {
+        const rolled = sum(rollDice(this.rng, 1, 6));
+        this.dealDamage(target, [{ type: "bludgeoning", amount: rolled }], actor.id, { critical: true });
+      }
+    } else if (degree === CRITICAL_FAILURE) {
+      this.addCondition(actor.id, { slug: "prone" });
+    }
+  }
+
+  /** Grab, restraint and immobilization that `from` imposes on `actor`: from effects, and applied directly. */
+  private restraintsFrom(actor: string, from: string): { effects: Effect[]; direct: Condition[] } {
+    const restraint = new Set<ConditionSlug>(["grabbed", "restrained", "immobilized"]);
+    const effects = this.effects.filter((e) => e.target === actor && e.source === from && e.conditions.some((c) => restraint.has(c.slug)));
+    const direct = this.creature(actor).conditions.filter((c) => restraint.has(c.slug) && c.source === from);
+    return { effects, direct };
+  }
+
+  /**
+   * Escape: the best of your unarmed attack, Acrobatics or Athletics against
+   * the grabber's Athletics DC. https://2e.aonprd.com/Actions.aspx?ID=2296
+   */
+  private escape(actor: Creature, from: Creature, map: number): void {
+    const unarmed = actor.strikes.filter((s) => s.traits.includes("unarmed"));
+    const options: Modifier[][] = [
+      ...unarmed.map((s) => [...s.attack, ...this.situational(actor.id, "attack", { kind: "attack", attribute: s.attackAttribute, range: "melee" }, from.id)]),
+      this.skillModifiers(actor.id, "acrobatics", from.id),
+      this.skillModifiers(actor.id, "athletics", from.id),
+    ];
+    const best = options.sort((a, b) => stackModifiers(b).total - stackModifiers(a).total)[0]!;
+    const mods = [...best];
+    if (map !== 0) mods.push({ label: "multiple attack penalty", type: "untyped", value: map });
+    const check = rollCheck(this.rng, mods, this.skillDC(from.id, "athletics", actor.id));
+    this.emit({ kind: "skill-check", creature: actor.id, action: "Escape", target: from.id, check });
+    if (check.degree >= SUCCESS) {
+      const { effects, direct } = this.restraintsFrom(actor.id, from.id);
+      for (const e of effects) this.endEffect(e, "removed");
+      for (const c of direct) this.removeCondition(actor, c.slug);
+      // A critical success also allows a free 5-foot Stride; not offered yet.
+    } else if (check.degree === CRITICAL_FAILURE) {
+      this.escapeBarred.add(actor.id);
+    }
+  }
+
+  // ---- damage, dying and death --------------------------------------------
+
+  /** Apply damage that isn't from a Strike: IWR, then HP, then dying or death. */
+  dealDamage(target: Creature, instances: readonly DamageInstance[], source: string, options: { critical: boolean; nonlethal?: boolean }): void {
+    if (target.dead) return;
+    const defended = applyDefenses(instances, target.defenses);
+    const hp = applyDamage(target, defended.total);
+    this.emit({ kind: "damage", creature: target.id, source, instances: defended.instances, total: defended.total, hp });
+    this.afterDamage(target, hp, defended.total, options);
+  }
+
+  /**
+   * What happens after HP drops: massive damage kills; dropping to 0 knocks a
+   * creature out (or kills a monster); damage while dying raises the dying value.
+   * https://2e.aonprd.com/Rules.aspx?ID=2324 (Getting Knocked Out), ID=2327 (Taking Damage), ID=2332 (Massive Damage)
+   */
+  private afterDamage(target: Creature, hp: HpChange, amount: number, options: { critical: boolean; nonlethal?: boolean }): void {
+    if (target.dead || amount <= 0) return;
+    if (hp.massiveDamage) return this.die(target, "massive-damage");
+    if (hp.after > 0) return;
+    if (this.has(target.id, "dying")) {
+      this.increaseDying(target, options.critical ? 2 : 1);
+    } else if (hp.before > 0 || !this.has(target.id, "unconscious")) {
+      this.knockOut(target, options.critical, options.nonlethal ?? false, hp.before > 0);
+    } else {
+      // Unconscious at 0 HP but stable, and damaged again: start dying.
+      this.knockOut(target, options.critical, options.nonlethal ?? false, false);
+    }
+  }
+
+  private knockOut(target: Creature, critical: boolean, nonlethal: boolean, moveInitiative: boolean): void {
+    if (!target.usesDyingRules && !nonlethal) return this.die(target, "zero-hp");
+
+    // Move to directly before the turn in which it was reduced to 0 HP.
+    const current = this.turn?.creature;
+    if (moveInitiative && current && current !== target.id) {
+      this.order.splice(this.order.indexOf(target.id), 1);
+      this.order.splice(this.order.indexOf(current), 0, target.id);
+    }
+
+    // Gaining dying while wounded adds the wounded value. https://2e.aonprd.com/Conditions.aspx?ID=99
+    const dying = nonlethal ? null : (critical ? 2 : 1) + conditionValue(target.conditions, "wounded");
+    this.emit({ kind: "knocked-out", creature: target.id, dying });
+    // Unconscious creatures fall prone. https://2e.aonprd.com/Conditions.aspx?ID=95
+    this.addCondition(target.id, { slug: "prone" });
+    if (dying === null) this.addCondition(target.id, { slug: "unconscious" });
+    else this.raiseDying(target, dying);
+  }
+
+  /** Dying value at which the creature dies: 4, less its doomed value. https://2e.aonprd.com/Conditions.aspx?ID=67 */
+  deathThreshold(target: Creature): number {
+    return 4 - conditionValue(target.conditions, "doomed");
+  }
+
+  private increaseDying(target: Creature, by: number): void {
+    this.raiseDying(target, conditionValue(target.conditions, "dying") + by);
+  }
+
+  private raiseDying(target: Creature, to: number): void {
+    const controller = this.controllers.get(target.id)!;
+    if (target.heroPoints > 0 && controller.spendHeroPoints?.(this, target.id, to)) {
+      // Heroic recovery: lose dying entirely, stabilize at 0 HP, no wounded.
+      this.emit({ kind: "hero-points", creature: target.id, spent: target.heroPoints });
+      target.heroPoints = 0;
+      this.removeCondition(target, "dying");
+      // Still unconscious at 0 HP, but stable.
+      this.addCondition(target.id, { slug: "unconscious" });
+      return;
+    }
+    if (to >= this.deathThreshold(target)) return this.die(target, "dying");
+    this.setCondition(target, "dying", to);
+  }
+
+  /** https://2e.aonprd.com/Rules.aspx?ID=2326 */
+  private recoveryCheck(target: Creature): void {
+    const dying = conditionValue(target.conditions, "dying");
+    const dc = 10 + dying;
+    const result = flatCheck(this.rng, dc);
+    const change = { [CRITICAL_SUCCESS]: -2, [SUCCESS]: -1, [FAILURE]: 1, [CRITICAL_FAILURE]: 2 }[result.degree];
+    this.emit({ kind: "recovery-check", creature: target.id, dc, result, dying: Math.max(0, dying + change) });
+    if (change > 0) return this.raiseDying(target, dying + change);
+    if (dying + change <= 0) {
+      // Stable at 0 HP: no longer dying, still unconscious.
+      this.addCondition(target.id, { slug: "unconscious" });
+      this.loseDying(target);
+    } else {
+      this.setCondition(target, "dying", dying + change);
+    }
+  }
+
+  /** Losing dying always adds wounded 1 or raises it by 1. https://2e.aonprd.com/Rules.aspx?ID=2328 */
+  private loseDying(target: Creature): void {
+    this.removeCondition(target, "dying");
+    this.setCondition(target, "wounded", conditionValue(target.conditions, "wounded") + 1);
+  }
+
+  private die(target: Creature, reason: "dying" | "massive-damage" | "zero-hp"): void {
+    if (target.dead) return;
+    target.dead = true;
+    target.hp.current = 0;
+    this.emit({ kind: "death", creature: target.id, reason });
+    this.removeCondition(target, "dying");
+    this.refreshDown(target);
+    this.checkForWinner();
+  }
+
+  /**
+   * Restore HP. Above 0 HP a dying or knocked-out creature wakes up; losing
+   * dying adds wounded. Dead creatures can't be healed.
+   * https://2e.aonprd.com/Conditions.aspx?ID=95 (Unconscious)
+   */
+  heal(id: string, amount: number): void {
+    const target = this.creature(id);
+    if (target.dead || amount <= 0) return;
+    const before = target.hp.current;
+    target.hp.current = Math.min(target.hp.max, before + amount);
+    this.emit({ kind: "healed", creature: id, amount, hp: { before, after: target.hp.current } });
+    if (target.hp.current > 0) {
+      if (target.conditions.some((c) => c.slug === "dying")) this.loseDying(target);
+      this.removeCondition(target, "unconscious");
+    }
+  }
+
+  /** End-of-turn persistent damage, all at once, then a DC 15 flat check for each. https://2e.aonprd.com/Conditions.aspx?ID=86 */
+  private persistentDamage(c: Creature): void {
+    const persistent = c.conditions.filter((x) => x.slug === "persistent-damage" && x.persistent);
+    if (!persistent.length) return;
+    const instances = persistent.map((x) => {
+      const p = x.persistent!;
+      return { type: p.type, amount: Math.max(1, sum(rollDice(this.rng, p.dice, p.die)) + p.bonus) };
+    });
+    this.dealDamage(c, instances, "persistent damage", { critical: false });
+    for (const x of persistent) {
+      if (c.dead) return;
+      const result = flatCheck(this.rng, 15);
+      this.emit({ kind: "flat-check", creature: c.id, purpose: `end persistent ${x.persistent!.type} damage`, result });
+      if (succeeded(result.degree)) {
+        c.conditions.splice(c.conditions.indexOf(x), 1);
+        this.emit({ kind: "condition", creature: c.id, slug: "persistent-damage", value: null, change: "lost" });
+      }
+    }
+  }
+
+  // ---- conditions ---------------------------------------------------------
+
+  /**
+   * Give a creature a condition directly. A valued condition keeps the higher
+   * value; persistent damage of a type it already has keeps the higher amount.
+   */
+  addCondition(id: string, condition: Condition): void {
+    const c = this.creature(id);
+    if (c.dead) return;
+    if (condition.slug === "persistent-damage") {
+      const same = c.conditions.find((x) => x.slug === "persistent-damage" && x.persistent?.type === condition.persistent?.type);
+      if (same) {
+        const keep = resolveConditions([same, condition]).find((x) => x.slug === "persistent-damage")!;
+        c.conditions.splice(c.conditions.indexOf(same), 1, keep);
+      } else {
+        c.conditions.push(condition);
+      }
+      this.emit({ kind: "condition", creature: id, slug: condition.slug, value: null, change: "gained" });
+      return;
+    }
+    const existing = c.conditions.find((x) => x.slug === condition.slug && sameAgainst(x, condition));
+    if (existing) {
+      if ((condition.value ?? 0) <= (existing.value ?? 0)) return;
+      if (condition.slug === "drained") this.drain(c, (existing.value ?? 0), condition.value ?? 0);
+      existing.value = condition.value;
+      this.emit({ kind: "condition", creature: id, slug: condition.slug, value: condition.value ?? null, change: "changed" });
+    } else {
+      if (condition.slug === "drained") this.drain(c, 0, condition.value ?? 0);
+      c.conditions.push({ ...condition });
+      this.emit({ kind: "condition", creature: id, slug: condition.slug, value: condition.value ?? null, change: "gained" });
+    }
+    this.refreshDown(c);
+  }
+
+  /** Set a valued condition's value; 0 or less removes it. */
+  private setCondition(c: Creature, slug: ConditionSlug, value: number): void {
+    const existing = c.conditions.find((x) => x.slug === slug && !x.against);
+    if (value <= 0) return this.removeCondition(c, slug);
+    if (existing) {
+      if (existing.value === value) return;
+      existing.value = value;
+      this.emit({ kind: "condition", creature: c.id, slug, value, change: "changed" });
+    } else {
+      c.conditions.push({ slug, value });
+      this.emit({ kind: "condition", creature: c.id, slug, value, change: "gained" });
+    }
+    this.refreshDown(c);
+  }
+
+  removeCondition(c: Creature, slug: ConditionSlug): void {
+    const before = c.conditions.length;
+    c.conditions = c.conditions.filter((x) => x.slug !== slug);
+    if (c.conditions.length !== before) this.emit({ kind: "condition", creature: c.id, slug, value: null, change: "lost" });
+    this.refreshDown(c);
+  }
+
+  /** Drained: lose level (minimum 1) × the increase in HP and max HP. Not damage. https://2e.aonprd.com/Conditions.aspx?ID=68 */
+  private drain(c: Creature, from: number, to: number): void {
+    const loss = Math.max(1, c.level) * (to - from);
+    c.hp.max -= loss;
+    c.hp.current = Math.max(0, Math.min(c.hp.current - loss, c.hp.max));
+  }
+
+  private refreshDown(c: Creature): void {
+    const wasDown = c.down;
+    c.down = c.dead || this.has(c.id, "unconscious");
+    if (c.down && !wasDown) {
+      this.emit({ kind: "down", creature: c.id });
       this.checkForWinner();
     }
-    return result;
   }
 
   // ---- reactions ----------------------------------------------------------
@@ -672,7 +1238,7 @@ export class Encounter {
     // makes a ranged attack, or leaves a square during a move action.
     // https://2e.aonprd.com/Actions.aspx?ID=2256
     const melee = this.meleeStrike(reactor);
-    if (reactor.reactions.includes("reactive-strike") && melee && isEnemy) {
+    if (reactor.reactions.includes("reactive-strike") && melee && isEnemy && !this.has(reactor.id, "restrained")) {
       const reach = this.reachWith(reactor, melee.profile);
       let qualifies = false;
       if (trigger.kind === "action") {
@@ -691,7 +1257,7 @@ export class Encounter {
             // The Strike neither counts toward nor takes the multiple attack penalty.
             this.emit({ kind: "action", creature: reactor.id, action: `Strike (${melee.profile.name})`, cost: 0, traits: ["attack", ...melee.profile.traits], reaction: true });
             const result = this.resolveStrike(reactor, triggerer, melee.profile, 0, true);
-            if (result.check.degree === CRITICAL_SUCCESS && trigger.kind === "action" && trigger.traits.includes("manipulate")) {
+            if (result?.check.degree === CRITICAL_SUCCESS && trigger.kind === "action" && trigger.traits.includes("manipulate")) {
               trigger.context.disrupted = true;
             }
           },
@@ -750,7 +1316,8 @@ export class Encounter {
   private readyTriggerMatches(reactor: Creature, ready: ReadyTrigger, trigger: Trigger): boolean {
     if (ready.kind === "enemy-enters-reach") {
       if (trigger.kind !== "enter-square") return false;
-      const reach = this.meleeStrike(reactor) ? this.reachWith(reactor, this.meleeStrike(reactor)!.profile) : reactor.reach;
+      const melee = this.meleeStrike(reactor);
+      const reach = melee ? this.reachWith(reactor, melee.profile) : reactor.reach;
       return Math.abs(this.space.position(reactor.id) - trigger.at) <= reach;
     }
     if (trigger.kind !== "action") return false;
@@ -759,7 +1326,15 @@ export class Encounter {
 
   // ---- effects ------------------------------------------------------------
 
-  addEffect(effect: { name: string; source: string; target: string; duration: Duration; modifiers?: readonly EffectModifier[]; tags?: readonly string[] }): Effect {
+  addEffect(effect: {
+    name: string;
+    source: string;
+    target: string;
+    duration: Duration;
+    modifiers?: readonly EffectModifier[];
+    conditions?: readonly Condition[];
+    tags?: readonly string[];
+  }): Effect {
     const created: Effect = {
       id: `effect-${this.nextEffectId++}`,
       name: effect.name,
@@ -767,10 +1342,12 @@ export class Encounter {
       target: effect.target,
       duration: effect.duration,
       modifiers: effect.modifiers ?? [],
+      conditions: effect.conditions ?? [],
       tags: effect.tags ?? [],
     };
     this.effects.push(created);
     this.emit({ kind: "effect-start", effect: created.id, name: created.name, target: created.target });
+    if (created.conditions.length && this.creatures.has(created.target)) this.refreshDown(this.creature(created.target));
     return created;
   }
 
@@ -784,6 +1361,7 @@ export class Encounter {
     if (index < 0) return;
     this.effects.splice(index, 1);
     this.emit({ kind: "effect-end", effect: effect.id, name: effect.name, target: effect.target, reason });
+    if (effect.conditions.length && this.creatures.has(effect.target)) this.refreshDown(this.creature(effect.target));
   }
 
   private standingAt(square: number): Creature[] {
@@ -793,4 +1371,9 @@ export class Encounter {
   private emit(event: EncounterEvent): void {
     this.events.push(event);
   }
+}
+
+function sameAgainst(a: Condition, b: Condition): boolean {
+  const key = (c: Condition) => (c.against ? [...c.against].sort().join(",") : "*");
+  return key(a) === key(b);
 }

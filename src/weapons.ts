@@ -14,6 +14,8 @@ export type WeaponTrait =
   | "propulsive"
   | "two-hand"
   | "disarm"
+  | "unarmed"
+  | "nonlethal"
   | `deadly-d${DieSize}`
   | `fatal-d${DieSize}`
   | `versatile-${"b" | "p" | "s"}`;
@@ -60,7 +62,7 @@ export const WEAPONS = {
     range: "melee",
     damageDie: 4,
     damageType: "bludgeoning",
-    traits: ["agile", "finesse"],
+    traits: ["agile", "finesse", "nonlethal", "unarmed"],
   },
 } as const satisfies Record<string, Weapon>;
 

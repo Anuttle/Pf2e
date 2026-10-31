@@ -1,6 +1,7 @@
 // A simple controller for monsters and for AI-vs-AI test fights. It is
-// deliberately plain: close in, attack, raise a shield instead of a weak third
-// attack, and always take a reaction when offered. It never Delays or Readies.
+// deliberately plain: get free and get up, close in, attack, raise a shield
+// instead of a weak third attack, always take a reaction when offered, and
+// spend Hero Points only to avoid dying. It never Delays or Readies.
 
 import type { Command, Controller, Encounter } from "./encounter.ts";
 import { SQUARE } from "./space.ts";
@@ -30,10 +31,24 @@ function approach(encounter: Encounter, id: string, targetId: string, reach: num
   return to === undefined ? null : { action: "stride", to };
 }
 
+/** The first of these commands that's legal right now. */
+function firstLegal(encounter: Encounter, id: string, commands: readonly Command[]): Command | undefined {
+  return commands.find((c) => !encounter.illegal(id, c));
+}
+
 export const aiController: Controller = {
   chooseAction(encounter, id) {
     const me = encounter.creature(id);
     const turn = encounter.turn!;
+
+    // Break free of a grab or restraint, then get up.
+    const holders = encounter.all().filter((c) => c.id !== id).map((c) => ({ action: "escape", from: c.id }) as Command);
+    if (encounter.has(id, "grabbed") || encounter.has(id, "restrained")) {
+      const escape = firstLegal(encounter, id, holders);
+      if (escape) return escape;
+    }
+    if (encounter.has(id, "prone") && !encounter.illegal(id, { action: "stand" })) return { action: "stand" };
+
     const target = nearestFoe(encounter, id);
     if (!target) return { action: "end-turn" };
 
@@ -42,7 +57,8 @@ export const aiController: Controller = {
     if (melee && encounter.space.distance(id, target.id) <= reach) {
       // A third attack at −10 rarely lands; a raised shield helps more.
       if (turn.attacks >= 2 && !encounter.illegal(id, { action: "raise-shield" })) return { action: "raise-shield" };
-      return { action: "strike", target: target.id, strike: melee.index };
+      const strike: Command = { action: "strike", target: target.id, strike: melee.index };
+      if (!encounter.illegal(id, strike)) return strike;
     }
 
     const rangedIndex = me.strikes.findIndex((s) => s.range === "ranged");
@@ -53,12 +69,16 @@ export const aiController: Controller = {
 
     if (melee) {
       const stride = approach(encounter, id, target.id, reach);
-      if (stride) return stride;
+      if (stride && !encounter.illegal(id, stride)) return stride;
     }
     return { action: "end-turn" };
   },
 
   chooseReaction(_encounter, _id, options) {
     return options.at(0) ?? null;
+  },
+
+  spendHeroPoints(encounter, id, to) {
+    return to >= encounter.deathThreshold(encounter.creature(id));
   },
 };

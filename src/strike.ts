@@ -90,7 +90,8 @@ export interface HpChange {
 
 /**
  * Temporary HP soak damage first; HP can't drop below 0. Damage in one blow of
- * at least twice max HP is massive damage (instant death).
+ * at least twice max HP is massive damage (instant death). What happens at 0 HP
+ * (dying, death) is up to the encounter.
  * https://2e.aonprd.com/Rules.aspx?ID=2319, https://2e.aonprd.com/Rules.aspx?ID=2332
  */
 export function applyDamage(target: Creature, amount: number): HpChange {
@@ -98,7 +99,6 @@ export function applyDamage(target: Creature, amount: number): HpChange {
   const tempAbsorbed = Math.min(target.hp.temp, amount);
   target.hp.temp -= tempAbsorbed;
   target.hp.current = Math.max(0, target.hp.current - (amount - tempAbsorbed));
-  if (target.hp.current === 0) target.down = true;
   return { before, after: target.hp.current, tempAbsorbed, massiveDamage: amount >= 2 * target.hp.max };
 }
 
@@ -140,5 +140,6 @@ export function strike(input: StrikeInput): StrikeResult {
   const damage = rollStrikeDamage(rng, profile, check.degree);
   const defended = applyDefenses([{ type: profile.damage.type, amount: damage.total }], target.defenses);
   const hp = applyDamage(target, defended.total);
+  if (target.hp.current === 0) target.down = true;
   return { attacker: attacker.id, target: target.id, weapon: profile.name, map, check, damage, defended, hp };
 }

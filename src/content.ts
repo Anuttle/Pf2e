@@ -10,7 +10,9 @@ import { WEAPONS } from "./weapons.ts";
  * Fighter proficiencies: https://2e.aonprd.com/Classes.aspx?ID=35 (Player Core pg. 136)
  * Chain mail +4 AC, Dex cap +1: https://2e.aonprd.com/Armor.aspx?ID=46 (Player Core pg. 273)
  * HP: human 8 + fighter (10 + Con 2) = 20. Speed 25 feet.
- * Fighters start with Reactive Strike and Shield Block.
+ * Fighters start with Reactive Strike and Shield Block, are expert in unarmed
+ * attacks, and Valeros is trained in Athletics. One Hero Point, as at the
+ * start of a session (https://2e.aonprd.com/Rules.aspx?ID=2333).
  */
 export function valeros(id = "valeros"): Creature {
   return buildCharacter({
@@ -23,7 +25,12 @@ export function valeros(id = "valeros"): Creature {
     armorRank: 1,
     perceptionRank: 2,
     saveRanks: { fortitude: 2, reflex: 2, will: 1 },
-    weapons: [{ weapon: WEAPONS.longsword, rank: 2 }],
+    weapons: [
+      { weapon: WEAPONS.longsword, rank: 2 },
+      { weapon: WEAPONS.fist, rank: 2 },
+    ],
+    skillRanks: { athletics: 1 },
+    heroPoints: 1,
     shield: WOODEN_SHIELD,
     reactions: ["reactive-strike", "shield-block"],
   });
@@ -40,6 +47,8 @@ export function goblinWarrior(id = "goblin-warrior", name = "Goblin Warrior"): C
     perception: 2,
     saves: { fortitude: 5, reflex: 7, will: 3 },
     speed: 25,
+    skills: { acrobatics: 5, athletics: 2 },
+    freeHands: 1,
     strikes: [
       { name: "dogslicer", range: "melee", attackBonus: 7, traits: ["agile", "backstabber", "finesse"], damage: { dice: 1, die: 6, type: "slashing" } },
       { name: "shortbow", range: "ranged", attackBonus: 7, traits: ["deadly-d10"], rangeIncrement: 60, damage: { dice: 1, die: 6, type: "piercing" } },

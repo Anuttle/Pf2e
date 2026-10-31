@@ -3,6 +3,7 @@
 // https://2e.aonprd.com/Rules.aspx?ID=2428 (Start Your Turn), https://2e.aonprd.com/Rules.aspx?ID=2430 (End Your Turn)
 // https://2e.aonprd.com/Actions.aspx?ID=2317 (Sustain)
 
+import type { Condition } from "./conditions.ts";
 import type { Modifier } from "./modifiers.ts";
 
 /** Which rolls or DCs a modifier applies to. */
@@ -39,6 +40,8 @@ export interface Effect {
   target: string;
   duration: Duration;
   modifiers: readonly EffectModifier[];
+  /** Conditions the target has while the effect lasts (e.g. grabbed by a Grapple). */
+  conditions: readonly Condition[];
   tags: readonly string[];
   /** Turn numbers already processed, so a Delayed turn never ticks twice. */
   lastStartTick?: number;

@@ -16,6 +16,8 @@ function profile(
     name: "test",
     range: "melee",
     traits: [],
+    attackAttribute: "str",
+    damageAttribute: "str",
     attack: [],
     ...overrides,
     damage: { dice: 1, die: 8, type: "slashing", modifiers: [], deadlyDice: 0, ...overrides.damage },
@@ -168,7 +170,6 @@ describe("hit points", () => {
     assert.equal(goblin.hp.current, 4);
     applyDamage(goblin, 50);
     assert.equal(goblin.hp.current, 0);
-    assert.equal(goblin.down, true);
   });
 
   it("flags massive damage at twice max HP in one blow", () => {
