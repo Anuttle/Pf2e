@@ -48,6 +48,14 @@ export interface Effect {
   weaponDice?: { strike: string; dice: number };
   /** Free-form numbers an effect needs (e.g. a magic shield's Hardness). */
   data?: Readonly<Record<string, number>>;
+  /**
+   * An aura around the effect's target: creatures on its side within `radius`
+   * feet (an emanation) get `modifiers`. Sustain can grow it by `growOnSustain`.
+   */
+  aura?: { radius: number; modifiers: readonly EffectModifier[]; growOnSustain?: number };
+  /** The creator's turn number when it was created, and when it was last Sustained. */
+  createdTurn?: number;
+  lastSustainedTurn?: number;
   tags: readonly string[];
   /** Turn numbers already processed, so a Delayed turn never ticks twice. */
   lastStartTick?: number;

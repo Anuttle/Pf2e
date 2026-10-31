@@ -48,6 +48,7 @@ import {
 import { type Modifier, stackModifiers } from "./modifiers.ts";
 import { type ShieldBlockResult, isBroken, shieldBlock } from "./shields.ts";
 import { type CastOptions, type SpellDefinition, type SpellHost, actionRange, cantripRank, SPELLS } from "./spells.ts";
+import { type Area, type Direction, type Space, type Square, spaceDistance, spaceInArea, cornerDistance } from "./areas.ts";
 import { LineSpace, SQUARE } from "./space.ts";
 import {
   type HpChange,
@@ -82,7 +83,16 @@ export type SingleCommand =
    * if given). `actions` picks the cost of a variable-action spell.
    * https://2e.aonprd.com/Actions.aspx?ID=2734
    */
-  | { action: "cast"; spell: string; rank?: number; actions?: number; targets?: readonly string[]; options?: CastOptions };
+  | {
+      action: "cast";
+      spell: string;
+      rank?: number;
+      actions?: number;
+      targets?: readonly string[];
+      /** For area spells: a burst's grid corner (in squares), or a cone's or line's direction. */
+      area?: { corner?: Square; direction?: Direction };
+      options?: CastOptions;
+    };
 
 export type ReadyTrigger =
   | { kind: "enemy-enters-reach" }
@@ -231,7 +241,7 @@ export type EncounterEvent =
   | { kind: "action-lost"; creature: string; action: string; reason: string }
   | { kind: "shield-block"; creature: string; result: ShieldBlockResult }
   | { kind: "spell-shield-block"; creature: string; prevented: number; remaining: number }
-  | { kind: "cast"; creature: string; spell: string; rank: number; actions: number; targets: readonly string[] }
+  | { kind: "cast"; creature: string; spell: string; rank: number; actions: number; targets: readonly string[]; area?: string }
   | { kind: "save"; creature: string; spell: string; save: SaveType; check: CheckResult }
   | { kind: "ready"; creature: string; readied: SingleCommand; trigger: ReadyTrigger }
   | { kind: "effect-start"; effect: string; name: string; target: string }
@@ -419,7 +429,54 @@ export class Encounter {
 
   /** Modifiers on one of a creature's rolls or DCs from effects and conditions. */
   situational(id: string, selector: Selector | null, ctx: RollContext, other?: string, strike?: string): Modifier[] {
-    return [...(selector ? modifiersFrom(this.effects, id, selector, strike) : []), ...conditionModifiers(this.conditions(id), ctx, other)];
+    return [
+      ...(selector ? modifiersFrom(this.effects, id, selector, strike) : []),
+      ...(selector ? this.auraModifiers(id, selector) : []),
+      ...conditionModifiers(this.conditions(id), ctx, other),
+    ];
+  }
+
+  /** Modifiers from allies' auras (e.g. bless) that `id` stands in. Its own aura covers it too. */
+  private auraModifiers(id: string, selector: Selector): Modifier[] {
+    const me = this.creature(id);
+    return this.effects
+      .filter((e) => e.aura && this.creatures.has(e.target) && this.creature(e.target).side === me.side)
+      .filter((e) => e.target === id || spaceDistance(this.spaceOf(e.target), this.spaceOf(id)) <= e.aura!.radius)
+      .flatMap((e) => e.aura!.modifiers.filter((m) => m.selector === selector).map((m) => m.modifier));
+  }
+
+  /**
+   * A creature's space in grid squares. Until the grid is wired in, everyone is
+   * Medium and stands on row 0 at x = feet / 5.
+   */
+  spaceOf(id: string): Space {
+    return { x: this.space.position(id) / SQUARE, y: 0, size: 1 };
+  }
+
+  /**
+   * The area a cast would cover, or null if the spell has no area at this
+   * action cost. Pass `rank` once the slot is expended.
+   */
+  castArea(caster: Creature, command: Extract<Command, { action: "cast" }>, rank = this.castRank(caster.id, command.spell, command.rank)): Area | null {
+    const def = SPELLS.get(command.spell);
+    if (!def?.area || rank === null) return null;
+    const spec = def.area(rank, command.actions ?? actionRange(def)[0]);
+    if (!spec) return null;
+    const space = this.spaceOf(caster.id);
+    switch (spec.kind) {
+      case "burst":
+        return command.area?.corner ? { kind: "burst", corner: command.area.corner, radius: spec.feet } : null;
+      case "emanation":
+        return { kind: "emanation", space, radius: spec.feet };
+      case "cone":
+      case "line":
+        return command.area?.direction ? { kind: spec.kind, space, direction: command.area.direction, length: spec.feet } : null;
+    }
+  }
+
+  /** Creatures in an area. An emanation's creator is in it only if the spell includes it. */
+  creaturesIn(area: Area, caster: Creature, includeCaster: boolean): Creature[] {
+    return this.all().filter((c) => !c.dead && (c.id === caster.id ? includeCaster && area.kind === "emanation" : spaceInArea(area, this.spaceOf(c.id))));
   }
 
   /** Spell DC: 10 + spell attack modifier parts + DC modifiers (stupefied, frightened...). */
@@ -563,8 +620,15 @@ export class Encounter {
         return null;
       case "sustain": {
         const effect = this.effects.find((e) => e.id === command.effect);
-        if (!effect || effect.source !== actorId || effect.duration.kind !== "sustained") return "no sustained effect to Sustain";
-        return null;
+        if (!effect || effect.source !== actorId) return "no effect of yours to Sustain";
+        if (effect.duration.kind === "sustained") return null;
+        if (effect.aura?.growOnSustain) {
+          // Bless: once per round, on turns after the one it was cast.
+          const turn = this.turnNumber(actorId);
+          if (turn <= (effect.createdTurn ?? 0)) return "can't Sustain it on the turn it was cast";
+          return effect.lastSustainedTurn === turn ? "already Sustained this turn" : null;
+        }
+        return "nothing to Sustain";
       }
       case "grapple":
       case "trip": {
@@ -606,6 +670,18 @@ export class Encounter {
     if (actions < min || actions > max) return `${def.name} takes ${min === max ? min : `${min} to ${max}`} actions`;
 
     const rank = this.castRank(caster.id, def.slug, command.rank)!;
+    const areaSpec = def.area?.(rank, actions);
+    if (areaSpec) {
+      if (command.targets?.length) return `${def.name} affects an area, not chosen targets`;
+      if (areaSpec.kind === "burst") {
+        const corner = command.area?.corner;
+        if (!corner) return `${def.name} needs a grid corner for its burst`;
+        const range = def.range(actions);
+        if (typeof range === "number" && cornerDistance(this.spaceOf(caster.id), corner) > range) return `that point is out of range`;
+      }
+      if ((areaSpec.kind === "cone" || areaSpec.kind === "line") && !command.area?.direction) return `${def.name} needs a direction`;
+      return null;
+    }
     const targets = command.targets ?? [];
     const { min: fewest, max: most } = def.targets(rank, actions);
     if (targets.length < fewest || targets.length > most) return `${def.name} takes ${fewest === most ? fewest : `${fewest} to ${most}`} target(s)`;
@@ -841,7 +917,17 @@ export class Encounter {
       castRank = this.castRank(actor.id, command.spell, command.rank) ?? 1;
       const def = SPELLS.get(command.spell)!;
       if (!def.cantrip) this.preparedSlot(actor, command.spell, command.rank)!.expended = true;
-      this.emit({ kind: "cast", creature: actor.id, spell: def.name, rank: castRank, actions: info.cost, targets: command.targets ?? [] });
+      const spec = def.area?.(castRank, info.cost);
+      const where = command.area?.direction ?? (command.area?.corner ? `at corner (${command.area.corner.x}, ${command.area.corner.y})` : "");
+      this.emit({
+        kind: "cast",
+        creature: actor.id,
+        spell: def.name,
+        rank: castRank,
+        actions: info.cost,
+        targets: command.targets ?? [],
+        ...(spec ? { area: `${spec.feet}-foot ${spec.kind}${where ? ` ${where}` : ""}` } : {}),
+      });
       // Stupefied: a DC 5 + value flat check, or the spell is disrupted. https://2e.aonprd.com/Conditions.aspx?ID=94
       const stupefied = conditionValue(this.conditions(actor.id), "stupefied");
       if (stupefied > 0) {
@@ -913,7 +999,10 @@ export class Encounter {
       case "sustain": {
         const effect = this.effects.find((e) => e.id === command.effect);
         const turnNumber = this.turnCounts.get(actor.id) ?? 0;
-        if (effect && effect.duration.kind === "sustained") effect.duration.expiresAfterTurn = turnNumber + 1;
+        if (!effect) return;
+        if (effect.duration.kind === "sustained") effect.duration.expiresAfterTurn = turnNumber + 1;
+        if (effect.aura?.growOnSustain) effect.aura = { ...effect.aura, radius: effect.aura.radius + effect.aura.growOnSustain };
+        effect.lastSustainedTurn = turnNumber;
         return;
       }
       case "grapple":
@@ -924,7 +1013,11 @@ export class Encounter {
         return this.escape(actor, this.creature(command.from), map);
       case "cast": {
         const def = SPELLS.get(command.spell)!;
-        const targets = (command.targets ?? []).map((id) => this.creature(id)).filter((t) => !t.dead);
+        // An area is resolved now, after any reactions, so it catches whoever is in it.
+        const area = this.castArea(actor, command, castRank);
+        const targets = area
+          ? this.creaturesIn(area, actor, def.includesCaster ?? false)
+          : (command.targets ?? []).map((id) => this.creature(id)).filter((t) => !t.dead);
         def.cast(this.spellHost(actor, def, castRank, map), {
           caster: actor,
           rank: castRank,
@@ -1232,6 +1325,8 @@ export class Encounter {
    */
   private afterDamage(target: Creature, hp: HpChange, amount: number, options: { critical: boolean; nonlethal?: boolean }): void {
     if (target.dead || amount <= 0) return;
+    // Taking damage wakes a sleeping creature that still has HP. https://2e.aonprd.com/Conditions.aspx?ID=95
+    if (hp.after > 0) this.wake(target);
     if (hp.massiveDamage) return this.die(target, "massive-damage");
     if (hp.after > 0) return;
     if (this.has(target.id, "dying")) {
@@ -1334,7 +1429,13 @@ export class Encounter {
     if (target.hp.current > 0) {
       if (target.conditions.some((c) => c.slug === "dying")) this.loseDying(target);
       this.removeCondition(target, "unconscious");
+      this.wake(target);
     }
+  }
+
+  /** End magical sleep on a creature. */
+  private wake(target: Creature): void {
+    for (const e of this.effects.filter((e) => e.target === target.id && e.tags.includes("asleep"))) this.endEffect(e, "removed");
   }
 
   /** End-of-turn persistent damage, all at once, then a DC 15 flat check for each. https://2e.aonprd.com/Conditions.aspx?ID=86 */
@@ -1586,6 +1687,7 @@ export class Encounter {
     conditions?: readonly Condition[];
     weaponDice?: { strike: string; dice: number };
     data?: Readonly<Record<string, number>>;
+    aura?: Effect["aura"];
     tags?: readonly string[];
   }): Effect {
     const created: Effect = {
@@ -1598,6 +1700,8 @@ export class Encounter {
       conditions: effect.conditions ?? [],
       ...(effect.weaponDice ? { weaponDice: effect.weaponDice } : {}),
       ...(effect.data ? { data: effect.data } : {}),
+      ...(effect.aura ? { aura: effect.aura } : {}),
+      createdTurn: this.turnNumber(effect.source),
       tags: effect.tags ?? [],
     };
     this.effects.push(created);
