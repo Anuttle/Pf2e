@@ -3,6 +3,7 @@
 
 import { type Creature, buildCharacter, buildMonster } from "./creature.ts";
 import { WOODEN_SHIELD } from "./shields.ts";
+import { type BattleMap, parseMap, placeToken } from "./grid.ts";
 import { WEAPONS } from "./weapons.ts";
 
 /**
@@ -54,4 +55,44 @@ export function goblinWarrior(id = "goblin-warrior", name = "Goblin Warrior"): C
       { name: "shortbow", range: "ranged", attackBonus: 7, traits: ["deadly-d10"], rangeIncrement: 60, damage: { dice: 1, die: 6, type: "piercing" } },
     ],
   });
+}
+
+/**
+ * A ruined courtyard for trying out the grid and views: a broken wall with a
+ * doorway, a raised 10-foot platform reached by a 5-foot step, rubble, and a
+ * pool. Valeros starts south of the wall, goblins north of it.
+ */
+export function goblinCourtyard(goblins = 3): { map: BattleMap; creatures: Creature[] } {
+  const map = parseMap(
+    [
+      "............",
+      '..""....~~..',
+      "........~~..",
+      "....##.####.",
+      "............",
+      '...&&...."".',
+      "............",
+      "............",
+    ],
+    {
+      elevation: [
+        "............",
+        "............",
+        "............",
+        "............",
+        "............",
+        "............",
+        "122.........",
+        "222.........",
+      ],
+    },
+  );
+  const creatures = [
+    valeros(),
+    ...Array.from({ length: goblins }, (_, i) => goblinWarrior(`goblin-${i + 1}`, `Goblin Warrior ${i + 1}`)),
+  ];
+  placeToken(map, "valeros", { x: 6, y: 5 });
+  const starts = [{ x: 5, y: 1 }, { x: 7, y: 2 }, { x: 3, y: 2 }, { x: 10, y: 1 }, { x: 1, y: 0 }];
+  creatures.slice(1).forEach((c, i) => placeToken(map, c.id, starts[i % starts.length]!));
+  return { map, creatures };
 }
