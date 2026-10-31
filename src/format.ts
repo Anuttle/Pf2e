@@ -52,7 +52,7 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     case "strike":
       return formatDamage(event.result);
     case "cast": {
-      const targets = event.targets.length ? ` at ${event.targets.map(name).join(", ")}` : "";
+      const targets = event.area ? `: ${event.area}` : event.targets.length ? ` at ${event.targets.map(name).join(", ")}` : "";
       return [`    ${name(event.creature)} casts ${event.spell} (rank ${event.rank}, ${event.actions} action${event.actions === 1 ? "" : "s"})${targets}`];
     }
     case "save": {

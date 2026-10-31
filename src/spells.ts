@@ -4,7 +4,7 @@
 //
 // A spell's `cast` runs after the Cast a Spell activity has been paid for and
 // survived any reactions. It talks to the encounter only through SpellHost.
-// Spells with areas (heal's 3-action version, fireball, ...) wait for the grid.
+// Area spells get every creature in the area as their targets.
 
 import { CRITICAL_FAILURE, CRITICAL_SUCCESS, type Degree, FAILURE, SUCCESS } from "./check.ts";
 import type { Condition } from "./conditions.ts";
@@ -47,6 +47,7 @@ export interface SpellHost {
     conditions?: readonly Condition[];
     weaponDice?: { strike: string; dice: number };
     data?: Record<string, number>;
+    aura?: { radius: number; modifiers: readonly EffectModifier[]; growOnSustain?: number };
     tags?: readonly string[];
   }): void;
   /** Temporary immunity to a spell (e.g. 10 minutes): it can't be cast again this encounter. */
@@ -84,6 +85,10 @@ export interface SpellDefinition {
   needsSight?: boolean;
   /** Can't be cast while the caster is immune (after sure strike or a shield block). */
   immunityTag?: string;
+  /** The spell's area at this rank and action cost, if any. https://2e.aonprd.com/Rules.aspx?ID=2384 */
+  area?: (rank: number, actions: number) => { kind: "burst" | "cone" | "emanation" | "line"; feet: number } | null;
+  /** An emanation's creator chooses whether it's affected; this is the spell's choice. */
+  includesCaster?: boolean;
   cast(host: SpellHost, cast: Cast): void;
 }
 
@@ -283,20 +288,24 @@ const SPELL_LIST: readonly SpellDefinition[] = [
     cantrip: false,
     traditions: ["divine", "primal"],
     traits: ["healing", "manipulate", "vitality"],
-    // The 3-action version is a 30-foot emanation; it waits for the grid.
-    actions: [1, 2],
+    actions: [1, 3],
     traitsFor: (actions) => (actions >= 2 ? ["concentrate"] : []),
-    range: (actions) => (actions === 1 ? "touch" : 30),
+    range: (actions) => (actions === 1 ? "touch" : actions === 2 ? 30 : null),
     targetKind: "willing-living-or-undead",
-    targets: one,
+    targets: (_rank, actions) => (actions === 3 ? { min: 0, max: 0 } : { min: 1, max: 1 }),
+    // 3 actions: every living and undead creature in a 30-foot emanation, the caster included.
+    area: (_rank, actions) => (actions === 3 ? { kind: "emanation", feet: 30 } : null),
+    includesCaster: true,
     cast(host, { rank, actions, targets }) {
-      const target = targets[0]!;
+      // One roll for everyone in the area.
       const rolled = sum(host.rollDice(rank, 8));
-      if (target.traits.includes("undead")) {
-        const amount = basicSaveDamage(host.save(target, "fortitude"), rolled);
-        if (amount > 0) host.damage(target, [{ type: "vitality", amount }], { critical: false, attack: false });
-      } else {
-        host.heal(target, rolled + (actions === 2 ? 8 * rank : 0));
+      for (const target of targets) {
+        if (target.traits.includes("undead")) {
+          const amount = basicSaveDamage(host.save(target, "fortitude"), rolled);
+          if (amount > 0) host.damage(target, [{ type: "vitality", amount }], { critical: false, attack: false });
+        } else if (!target.traits.includes("construct")) {
+          host.heal(target, rolled + (actions === 2 ? 8 * rank : 0));
+        }
       }
     },
   },
@@ -371,7 +380,140 @@ const SPELL_LIST: readonly SpellDefinition[] = [
       });
     },
   },
+
+  // ---- area spells ----------------------------------------------------------
+  {
+    slug: "breathe-fire",
+    name: "Breathe Fire",
+    source: "https://2e.aonprd.com/Spells.aspx?ID=1457",
+    rank: 1,
+    cantrip: false,
+    traditions: ["arcane", "primal"],
+    traits: ["concentrate", "fire", "manipulate"],
+    actions: 2,
+    range: () => null,
+    targetKind: "none",
+    targets: none,
+    area: () => ({ kind: "cone", feet: 15 }),
+    cast(host, { rank, targets }) {
+      areaDamage(host, targets, { dice: 2 + 2 * steps(rank, 1, 1), die: 6, type: "fire", save: "reflex" });
+    },
+  },
+  {
+    slug: "sleep",
+    name: "Sleep",
+    source: "https://2e.aonprd.com/Spells.aspx?ID=1675",
+    rank: 1,
+    cantrip: false,
+    traditions: ["arcane", "occult"],
+    traits: ["concentrate", "incapacitation", "manipulate", "mental", "sleep"],
+    actions: 2,
+    range: () => 30,
+    targetKind: "none",
+    targets: none,
+    area: () => ({ kind: "burst", feet: 5 }),
+    cast(host, { rank, targets }) {
+      const heightened = rank >= 4;
+      for (const target of targets) {
+        const degree = host.save(target, "will");
+        if (degree === CRITICAL_SUCCESS) continue;
+        if (degree === SUCCESS) {
+          host.addEffect({
+            name: "drowsy (sleep)",
+            target,
+            duration: { kind: "rounds", remaining: 1 },
+            modifiers: [{ selector: "perception", modifier: { label: "sleep", type: "status", value: -1 } }],
+          });
+          continue;
+        }
+        // Base: unconscious up to 1 minute (failure) or 1 hour; heightened (4th): 1 round or 1 minute, and prone.
+        const rounds = heightened ? (degree === FAILURE ? 1 : 10) : degree === FAILURE ? 10 : 600;
+        host.addEffect({
+          name: "asleep (sleep)",
+          target,
+          duration: { kind: "rounds", remaining: rounds },
+          conditions: [{ slug: "unconscious" }],
+          tags: ["asleep"],
+        });
+        if (heightened) host.addCondition(target, { slug: "prone" });
+      }
+    },
+  },
+  {
+    slug: "bless",
+    name: "Bless",
+    source: "https://2e.aonprd.com/Spells.aspx?ID=1451",
+    rank: 1,
+    cantrip: false,
+    traditions: ["divine", "occult"],
+    traits: ["aura", "concentrate", "manipulate", "mental"],
+    actions: 2,
+    range: () => null,
+    targetKind: "none",
+    targets: none,
+    cast(host, { caster }) {
+      // You and allies within the 15-foot emanation get +1 status to attack rolls.
+      // Sustain (once a round, on later turns) widens it by 10 feet.
+      host.addEffect({
+        name: "bless",
+        target: caster,
+        duration: { ...MINUTE },
+        aura: {
+          radius: 15,
+          growOnSustain: 10,
+          modifiers: [{ selector: "attack", modifier: { label: "bless", type: "status", value: 1 } }],
+        },
+      });
+    },
+  },
+  {
+    slug: "fireball",
+    name: "Fireball",
+    source: "https://2e.aonprd.com/Spells.aspx?ID=1530",
+    rank: 3,
+    cantrip: false,
+    traditions: ["arcane", "primal"],
+    traits: ["concentrate", "fire", "manipulate"],
+    actions: 2,
+    range: () => 500,
+    targetKind: "none",
+    targets: none,
+    area: () => ({ kind: "burst", feet: 20 }),
+    cast(host, { rank, targets }) {
+      areaDamage(host, targets, { dice: 6 + 2 * steps(rank, 3, 1), die: 6, type: "fire", save: "reflex" });
+    },
+  },
+  {
+    slug: "lightning-bolt",
+    name: "Lightning Bolt",
+    source: "https://2e.aonprd.com/Spells.aspx?ID=1586",
+    rank: 3,
+    cantrip: false,
+    traditions: ["arcane", "primal"],
+    traits: ["concentrate", "electricity", "manipulate"],
+    actions: 2,
+    range: () => null,
+    targetKind: "none",
+    targets: none,
+    area: () => ({ kind: "line", feet: 120 }),
+    cast(host, { rank, targets }) {
+      areaDamage(host, targets, { dice: 4 + steps(rank, 3, 1), die: 12, type: "electricity", save: "reflex" });
+    },
+  },
 ];
+
+/** One damage roll for the whole area; each creature gets its own basic save. */
+function areaDamage(
+  host: SpellHost,
+  targets: readonly Creature[],
+  { dice, die, type, save }: { dice: number; die: number; type: DamageInstance["type"]; save: SaveType },
+): void {
+  const rolled = sum(host.rollDice(dice, die));
+  for (const target of targets) {
+    const amount = basicSaveDamage(host.save(target, save), rolled);
+    if (amount > 0) host.damage(target, [{ type, amount }], { critical: false, attack: false });
+  }
+}
 
 export const SPELLS: ReadonlyMap<string, SpellDefinition> = new Map(SPELL_LIST.map((s) => [s.slug, s]));
 
