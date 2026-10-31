@@ -96,3 +96,73 @@ export function goblinCourtyard(goblins = 3): { map: BattleMap; creatures: Creat
   creatures.slice(1).forEach((c, i) => placeToken(map, c.id, starts[i % starts.length]!));
   return { map, creatures };
 }
+
+/**
+ * Level 1 human wizard: Intelligence-based arcane prepared caster.
+ * Wizard proficiencies and slots: https://2e.aonprd.com/Classes.aspx?ID=39 (Player Core):
+ * trained Perception, Fortitude and Reflex, expert Will, trained spell attack
+ * and DC, untrained in armor; 5 cantrips and two 1st-rank slots, plus one
+ * curriculum spell (here sure strike). HP: human 8 + wizard (6 + Con 1) = 15.
+ */
+export function ezren(id = "ezren"): Creature {
+  return buildCharacter({
+    id,
+    name: "Ezren",
+    level: 1,
+    attributes: { str: 0, dex: 2, con: 1, int: 4, wis: 1, cha: 0 },
+    maxHp: 15,
+    armor: { name: "unarmored", acBonus: 0, dexCap: Infinity },
+    armorRank: 1,
+    perceptionRank: 1,
+    saveRanks: { fortitude: 1, reflex: 1, will: 2 },
+    weapons: [{ weapon: WEAPONS.fist, rank: 1 }],
+    spellcasting: {
+      tradition: "arcane",
+      attribute: "int",
+      rank: 1,
+      cantrips: ["ignition", "telekinetic-projectile", "electric-arc", "daze", "shield"],
+      prepared: [
+        { spell: "force-barrage", rank: 1 },
+        { spell: "fear", rank: 1 },
+        { spell: "sure-strike", rank: 1 },
+      ],
+    },
+    freeHands: 2,
+    heroPoints: 1,
+  });
+}
+
+/**
+ * Level 1 human cloistered cleric: Wisdom-based divine prepared caster.
+ * Cleric proficiencies and slots: https://2e.aonprd.com/Classes.aspx?ID=33 (Player Core):
+ * trained Perception, Fortitude and Reflex, expert Will, trained spell attack
+ * and DC; two 1st-rank slots and five cantrips, plus 4 heal slots from a
+ * healing font. HP: human 8 + cleric (8 + Con 1) = 17.
+ */
+export function kyra(id = "kyra"): Creature {
+  return buildCharacter({
+    id,
+    name: "Kyra",
+    level: 1,
+    attributes: { str: 1, dex: 1, con: 1, int: 0, wis: 4, cha: 1 },
+    maxHp: 17,
+    armor: { name: "unarmored", acBonus: 0, dexCap: Infinity },
+    armorRank: 1,
+    perceptionRank: 1,
+    saveRanks: { fortitude: 1, reflex: 1, will: 2 },
+    weapons: [{ weapon: WEAPONS.fist, rank: 1 }],
+    spellcasting: {
+      tradition: "divine",
+      attribute: "wis",
+      rank: 1,
+      cantrips: ["daze", "shield"],
+      prepared: [
+        { spell: "enfeeble", rank: 1 },
+        { spell: "runic-weapon", rank: 1 },
+        ...Array.from({ length: 4 }, () => ({ spell: "heal", rank: 1 })),
+      ],
+    },
+    freeHands: 2,
+    heroPoints: 1,
+  });
+}

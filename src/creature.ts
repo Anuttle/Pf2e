@@ -50,6 +50,30 @@ export type SaveType = "fortitude" | "reflex" | "will";
 /** Reactions the engine knows how to offer. */
 export type ReactionSlug = "reactive-strike" | "shield-block";
 
+export type Tradition = "arcane" | "divine" | "occult" | "primal";
+
+export interface PreparedSpell {
+  spell: string;
+  /** The rank it's prepared at, which may be higher than the spell's own (heightened). */
+  rank: number;
+  expended: boolean;
+}
+
+/**
+ * A prepared spellcaster's spells for the day. Cantrips can be cast at will and
+ * heighten to half the caster's level rounded up; each prepared spell is
+ * expended when cast. https://2e.aonprd.com/Rules.aspx?ID=2223,
+ * https://2e.aonprd.com/Traits.aspx?ID=550
+ */
+export interface Spellcasting {
+  tradition: Tradition;
+  attribute: Attribute;
+  /** Spell attack modifier parts; the spell DC is 10 + the same total. https://2e.aonprd.com/Rules.aspx?ID=2293 */
+  attack: readonly Modifier[];
+  cantrips: readonly string[];
+  prepared: PreparedSpell[];
+}
+
 export interface Creature {
   id: string;
   name: string;
@@ -67,6 +91,9 @@ export interface Creature {
   reach: number;
   reactions: readonly ReactionSlug[];
   shield?: ShieldState;
+  /** Creature traits that rules check, e.g. "undead" for heal. */
+  traits: readonly string[];
+  spellcasting?: Spellcasting;
   skills: Readonly<Partial<Record<Skill, readonly Modifier[]>>>;
   /** Hands not holding anything, for Grapple and Trip. */
   freeHands: number;
@@ -113,6 +140,14 @@ export interface CharacterSpec {
   saveRanks: Record<SaveType, ProficiencyRank>;
   weapons: readonly WieldedWeapon[];
   skillRanks?: Partial<Record<Skill, ProficiencyRank>>;
+  spellcasting?: {
+    tradition: Tradition;
+    attribute: Attribute;
+    rank: ProficiencyRank;
+    cantrips: readonly string[];
+    prepared: readonly { spell: string; rank: number }[];
+  };
+  traits?: readonly string[];
   freeHands?: number;
   heroPoints?: number;
   speed?: number;
@@ -198,6 +233,21 @@ export function buildCharacter(spec: CharacterSpec): Creature {
     reach: 5,
     reactions: spec.reactions ?? [],
     ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
+    traits: spec.traits ?? ["humanoid"],
+    ...(spec.spellcasting
+      ? {
+          spellcasting: {
+            tradition: spec.spellcasting.tradition,
+            attribute: spec.spellcasting.attribute,
+            attack: [
+              attr(spec.spellcasting.attribute[0]!.toUpperCase() + spec.spellcasting.attribute.slice(1), a[spec.spellcasting.attribute]),
+              prof(spec.spellcasting.rank, level),
+            ],
+            cantrips: spec.spellcasting.cantrips,
+            prepared: spec.spellcasting.prepared.map((p) => ({ ...p, expended: false })),
+          },
+        }
+      : {}),
     skills: {
       athletics: [attr("Str", a.str), prof(spec.skillRanks?.athletics ?? 0, level)],
       acrobatics: [attr("Dex", a.dex), prof(spec.skillRanks?.acrobatics ?? 0, level)],
@@ -237,6 +287,15 @@ export interface MonsterSpec {
   reactions?: readonly ReactionSlug[];
   shield?: ShieldData;
   skills?: Partial<Record<Skill, number>>;
+  traits?: readonly string[];
+  /** A stat block's spell DC and attack, e.g. "Arcane Prepared Spells DC 17, attack +9". */
+  spellcasting?: {
+    tradition: Tradition;
+    attribute: Attribute;
+    attack: number;
+    cantrips: readonly string[];
+    prepared: readonly { spell: string; rank: number }[];
+  };
   freeHands?: number;
   /** Villains and important foes may use the PC dying rules. */
   usesDyingRules?: boolean;
@@ -289,6 +348,18 @@ export function buildMonster(spec: MonsterSpec): Creature {
     reach: spec.reach ?? 5,
     reactions: spec.reactions ?? [],
     ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
+    traits: spec.traits ?? [],
+    ...(spec.spellcasting
+      ? {
+          spellcasting: {
+            tradition: spec.spellcasting.tradition,
+            attribute: spec.spellcasting.attribute,
+            attack: [base("stat block", spec.spellcasting.attack)],
+            cantrips: spec.spellcasting.cantrips,
+            prepared: spec.spellcasting.prepared.map((p) => ({ ...p, expended: false })),
+          },
+        }
+      : {}),
     skills: Object.fromEntries(Object.entries(spec.skills ?? {}).map(([k, v]) => [k, [base("stat block", v)]])),
     freeHands: spec.freeHands ?? 0,
     conditions: [],

@@ -12,6 +12,8 @@ export type Selector = "ac" | "attack" | "damage" | "perception" | "fortitude" |
 export interface EffectModifier {
   selector: Selector;
   modifier: Modifier;
+  /** Only for Strikes with this weapon or attack (e.g. a Runic Weapon). */
+  strike?: string;
 }
 
 export type Duration =
@@ -42,6 +44,10 @@ export interface Effect {
   modifiers: readonly EffectModifier[];
   /** Conditions the target has while the effect lasts (e.g. grabbed by a Grapple). */
   conditions: readonly Condition[];
+  /** Raises a weapon's damage dice to this many (e.g. a Runic Weapon's striking). */
+  weaponDice?: { strike: string; dice: number };
+  /** Free-form numbers an effect needs (e.g. a magic shield's Hardness). */
+  data?: Readonly<Record<string, number>>;
   tags: readonly string[];
   /** Turn numbers already processed, so a Delayed turn never ticks twice. */
   lastStartTick?: number;
@@ -83,8 +89,8 @@ export function tickTurnEnd(effects: Effect[], creature: string, turn: number): 
   return ended;
 }
 
-export function modifiersFrom(effects: readonly Effect[], target: string, selector: Selector): Modifier[] {
+export function modifiersFrom(effects: readonly Effect[], target: string, selector: Selector, strike?: string): Modifier[] {
   return effects
     .filter((e) => e.target === target)
-    .flatMap((e) => e.modifiers.filter((m) => m.selector === selector).map((m) => m.modifier));
+    .flatMap((e) => e.modifiers.filter((m) => m.selector === selector && (!m.strike || m.strike === strike)).map((m) => m.modifier));
 }

@@ -11,6 +11,7 @@
 
 import {
   type CheckResult,
+  type DegreeAdjuster,
   CRITICAL_FAILURE,
   CRITICAL_SUCCESS,
   type Degree,
@@ -46,6 +47,7 @@ import {
 } from "./effects.ts";
 import { type Modifier, stackModifiers } from "./modifiers.ts";
 import { type ShieldBlockResult, isBroken, shieldBlock } from "./shields.ts";
+import { type CastOptions, type SpellDefinition, type SpellHost, actionRange, cantripRank, SPELLS } from "./spells.ts";
 import { LineSpace, SQUARE } from "./space.ts";
 import {
   type HpChange,
@@ -74,7 +76,13 @@ export type SingleCommand =
   | { action: "grapple"; target: string }
   | { action: "trip"; target: string }
   /** Escape whatever grab, restraint or immobilization `from` is imposing. */
-  | { action: "escape"; from: string };
+  | { action: "escape"; from: string }
+  /**
+   * Cast a Spell. A cantrip, or the first unexpended prepared copy (at `rank`
+   * if given). `actions` picks the cost of a variable-action spell.
+   * https://2e.aonprd.com/Actions.aspx?ID=2734
+   */
+  | { action: "cast"; spell: string; rank?: number; actions?: number; targets?: readonly string[]; options?: CastOptions };
 
 export type ReadyTrigger =
   | { kind: "enemy-enters-reach" }
@@ -120,6 +128,12 @@ function actionInfo(actor: Creature, command: Command): ActionInfo {
       return { name: "Trip", cost: 1, traits: ["attack"] };
     case "escape":
       return { name: "Escape", cost: 1, traits: ["attack"] };
+    case "cast": {
+      const def = SPELLS.get(command.spell);
+      if (!def) return { name: `Cast ${command.spell}`, cost: 1, traits: [] };
+      const cost = command.actions ?? actionRange(def)[0];
+      return { name: `Cast ${def.name}`, cost, traits: [...def.traits, ...(def.traitsFor?.(cost) ?? [])] };
+    }
     case "ready":
       return { name: "Ready", cost: 2, traits: ["concentrate"] };
     case "end-turn":
@@ -145,12 +159,15 @@ export type Trigger =
       kind: "incoming-damage";
       actor: string;
       target: string;
-      type: DamageType;
+      types: readonly DamageType[];
+      /** From an attack (Shield Block needs one), and/or from a spell or other magic (the shield spell can block it). */
+      attack: boolean;
+      magical: boolean;
       pending: { amount: number; block?: ShieldBlockResult };
     };
 
 export interface ReactionOption {
-  reaction: ReactionSlug | "readied";
+  reaction: ReactionSlug | "readied" | "shield-spell";
   label: string;
 }
 
@@ -213,6 +230,9 @@ export type EncounterEvent =
   | { kind: "disrupted"; creature: string; action: string }
   | { kind: "action-lost"; creature: string; action: string; reason: string }
   | { kind: "shield-block"; creature: string; result: ShieldBlockResult }
+  | { kind: "spell-shield-block"; creature: string; prevented: number; remaining: number }
+  | { kind: "cast"; creature: string; spell: string; rank: number; actions: number; targets: readonly string[] }
+  | { kind: "save"; creature: string; spell: string; save: SaveType; check: CheckResult }
   | { kind: "ready"; creature: string; readied: SingleCommand; trigger: ReadyTrigger }
   | { kind: "effect-start"; effect: string; name: string; target: string }
   | { kind: "effect-end"; effect: string; name: string; target: string; reason: EffectEndReason }
@@ -311,6 +331,8 @@ export class Encounter {
   private readonly readied = new Map<string, Readied>();
   /** Creatures that critically failed to Escape and can't try again until their next turn. */
   private readonly escapeBarred = new Set<string>();
+  /** Spells each creature is temporarily immune to (10 minutes: the rest of the encounter). */
+  private readonly spellImmunities = new Map<string, Set<string>>();
   /** Turn number whose persistent damage and frightened decrease already happened (a Delay does them early). */
   private readonly endOfTurnDone = new Map<string, number>();
   private readonly maxRounds: number;
@@ -396,8 +418,36 @@ export class Encounter {
   }
 
   /** Modifiers on one of a creature's rolls or DCs from effects and conditions. */
-  situational(id: string, selector: Selector | null, ctx: RollContext, other?: string): Modifier[] {
-    return [...(selector ? modifiersFrom(this.effects, id, selector) : []), ...conditionModifiers(this.conditions(id), ctx, other)];
+  situational(id: string, selector: Selector | null, ctx: RollContext, other?: string, strike?: string): Modifier[] {
+    return [...(selector ? modifiersFrom(this.effects, id, selector, strike) : []), ...conditionModifiers(this.conditions(id), ctx, other)];
+  }
+
+  /** Spell DC: 10 + spell attack modifier parts + DC modifiers (stupefied, frightened...). */
+  spellDC(id: string, other?: string): number {
+    const sc = this.creature(id).spellcasting;
+    if (!sc) throw new Error(`${id} can't cast spells`);
+    return 10 + stackModifiers([...sc.attack, ...this.situational(id, null, { kind: "spell-dc", attribute: sc.attribute }, other)]).total;
+  }
+
+  spellImmune(id: string, spell: string): boolean {
+    return this.spellImmunities.get(id)?.has(spell) ?? false;
+  }
+
+  /** The rank a cast would use: the cantrip rank, or the prepared slot it would expend. Null if it can't be cast. */
+  castRank(id: string, spellSlug: string, rank?: number): number | null {
+    const c = this.creature(id);
+    const def = SPELLS.get(spellSlug);
+    const sc = c.spellcasting;
+    if (!def || !sc) return null;
+    if (def.cantrip) return sc.cantrips.includes(spellSlug) ? cantripRank(c.level) : null;
+    const slot = this.preparedSlot(c, spellSlug, rank);
+    return slot ? slot.rank : null;
+  }
+
+  private preparedSlot(c: Creature, spellSlug: string, rank?: number) {
+    return c.spellcasting?.prepared
+      .filter((p) => p.spell === spellSlug && !p.expended && (rank === undefined || p.rank === rank))
+      .sort((a, b) => a.rank - b.rank)[0];
   }
 
   skillModifiers(id: string, skill: Skill, other?: string): Modifier[] {
@@ -451,6 +501,17 @@ export class Encounter {
       if (this.has(actorId, "immobilized")) return "immobilized: can't use move actions";
       // https://2e.aonprd.com/Conditions.aspx?ID=88
       if (prone && command.action !== "crawl" && command.action !== "stand") return "prone: the only move actions are Crawl and Stand";
+    }
+    // Fleeing: every action must be spent getting away from the source. https://2e.aonprd.com/Conditions.aspx?ID=74
+    const fleeing = this.conditions(actorId).find((c) => c.slug === "fleeing");
+    if (fleeing?.source && this.space.has(fleeing.source)) {
+      const away = command.action === "stride" || command.action === "step" || command.action === "crawl";
+      if (command.action === "ready") return "can't Ready while fleeing";
+      if (!away && command.action !== "stand") return `fleeing: must spend actions getting away from ${fleeing.source}`;
+      if (away) {
+        const source = this.space.position(fleeing.source);
+        if (Math.abs(command.to - source) <= Math.abs(this.space.position(actorId) - source)) return "fleeing: must move away from the source";
+      }
     }
     // https://2e.aonprd.com/Conditions.aspx?ID=90
     if (this.has(actorId, "restrained") && (traits.includes("attack") || traits.includes("manipulate")) && command.action !== "escape") {
@@ -521,12 +582,55 @@ export class Encounter {
         const { effects, direct } = this.restraintsFrom(actorId, command.from);
         return effects.length + direct.length ? null : `nothing from ${command.from} to Escape`;
       }
+      case "cast":
+        return this.illegalCast(actor, command);
       case "ready": {
         if (asReaction) return "can't Ready as a reaction";
         const cost = actionInfo(actor, command.readied).cost;
         return cost === 1 ? null : "Ready holds a single action";
       }
     }
+  }
+
+  /** https://2e.aonprd.com/Rules.aspx?ID=2233 (Casting Spells), ID=2237 (Ranges, Areas, and Targets) */
+  private illegalCast(caster: Creature, command: Extract<Command, { action: "cast" }>): string | null {
+    const def = SPELLS.get(command.spell);
+    if (!def) return `unknown spell ${command.spell}`;
+    if (!caster.spellcasting) return "can't cast spells";
+    if (this.castRank(caster.id, def.slug, command.rank) === null) {
+      return def.cantrip ? `${def.name} isn't one of your cantrips` : `no unexpended ${def.name} prepared${command.rank ? ` at rank ${command.rank}` : ""}`;
+    }
+    if (def.immunityTag && this.spellImmune(caster.id, def.immunityTag)) return `temporarily immune to ${def.name}`;
+    const [min, max] = actionRange(def);
+    const actions = command.actions ?? min;
+    if (actions < min || actions > max) return `${def.name} takes ${min === max ? min : `${min} to ${max}`} actions`;
+
+    const rank = this.castRank(caster.id, def.slug, command.rank)!;
+    const targets = command.targets ?? [];
+    const { min: fewest, max: most } = def.targets(rank, actions);
+    if (targets.length < fewest || targets.length > most) return `${def.name} takes ${fewest === most ? fewest : `${fewest} to ${most}`} target(s)`;
+    if (!def.repeatTargets && new Set(targets).size !== targets.length) return "the same target twice";
+    const range = def.range(actions);
+    for (const id of new Set(targets)) {
+      const target = this.creatures.get(id);
+      if (!target || target.dead) return `invalid target ${id}`;
+      const distance = this.space.distance(caster.id, id);
+      if (range === "touch" ? distance > caster.reach : range !== null && distance > range) return `${target.name} is out of range`;
+      if (def.needsSight && this.hiddenFrom(id, caster.id)) return `can't see ${target.name}`;
+      if (def.targetKind === "willing-living-or-undead" && !target.traits.includes("undead")) {
+        if (target.side !== caster.side) return `${target.name} isn't willing`;
+        if (target.traits.includes("construct")) return `${target.name} isn't living`;
+      }
+      if (def.targetKind === "ally-weapon") {
+        if (target.side !== caster.side) return `${target.name} isn't willing`;
+        if (!target.strikes.some((s) => s.range === "melee")) return `${target.name} isn't wielding a weapon`;
+      }
+    }
+    if (command.options?.melee) {
+      const t = targets[0];
+      if (!t || this.space.distance(caster.id, t) > caster.reach) return "melee spell attack needs a target within reach";
+    }
+    return null;
   }
 
   private validTarget(actorId: string, targetId: string): Creature | string {
@@ -541,6 +645,8 @@ export class Encounter {
     this.start();
     while (!this.finished && this.round < this.maxRounds) this.playRound();
     if (!this.finished) this.finish(null);
+    // Logged last, after whatever the final blow set off.
+    this.emit({ kind: "end", winner: this.winner, rounds: this.round });
     return { seed: this.seed, events: this.events, winner: this.winner, rounds: this.round };
   }
 
@@ -598,7 +704,7 @@ export class Encounter {
     }
 
     const controller = this.controllers.get(id)!;
-    if (this.canAct(id) && controller.delayTurn?.(this, id)) {
+    if (this.canAct(id) && !this.has(id, "fleeing") && controller.delayTurn?.(this, id)) {
       this.delayed.add(id);
       this.emit({ kind: "delay", creature: id });
       // Negative effects at the end of the turn happen now, and beneficial
@@ -688,7 +794,6 @@ export class Encounter {
     if (this.finished) return;
     this.finished = true;
     this.winner = winner;
-    this.emit({ kind: "end", winner, rounds: this.round });
   }
 
   private checkForWinner(): void {
@@ -729,6 +834,26 @@ export class Encounter {
     if (isAttack && !options.reaction && this.turn) this.turn.attacks += 1;
     const map = options.map ?? (options.reaction ? 0 : multipleAttackPenalty(priorAttacks, this.mapTraits(actor, command)));
 
+    // Casting expends the spell (and its slot) up front, so a disrupted spell is lost.
+    // https://2e.aonprd.com/Rules.aspx?ID=2236
+    let castRank = 0;
+    if (command.action === "cast") {
+      castRank = this.castRank(actor.id, command.spell, command.rank) ?? 1;
+      const def = SPELLS.get(command.spell)!;
+      if (!def.cantrip) this.preparedSlot(actor, command.spell, command.rank)!.expended = true;
+      this.emit({ kind: "cast", creature: actor.id, spell: def.name, rank: castRank, actions: info.cost, targets: command.targets ?? [] });
+      // Stupefied: a DC 5 + value flat check, or the spell is disrupted. https://2e.aonprd.com/Conditions.aspx?ID=94
+      const stupefied = conditionValue(this.conditions(actor.id), "stupefied");
+      if (stupefied > 0) {
+        const result = flatCheck(this.rng, 5 + stupefied);
+        this.emit({ kind: "flat-check", creature: actor.id, purpose: `cast ${def.name} while stupefied`, result });
+        if (!succeeded(result.degree)) {
+          this.emit({ kind: "disrupted", creature: actor.id, action: info.name });
+          return;
+        }
+      }
+    }
+
     // Grabbed: a manipulate action needs a DC 5 flat check after it's spent, before any effects.
     // https://2e.aonprd.com/Conditions.aspx?ID=77
     if (info.traits.includes("manipulate") && this.has(actor.id, "grabbed")) {
@@ -742,7 +867,10 @@ export class Encounter {
 
     // Step doesn't trigger reactions to move actions; Crawl does.
     if (command.action !== "step") {
-      const ranged = command.action === "strike" && actor.strikes[command.strike ?? 0]?.range === "ranged";
+      // A ranged Strike, or a spell attack that isn't made in melee, is a ranged attack.
+      const ranged =
+        (command.action === "strike" && actor.strikes[command.strike ?? 0]?.range === "ranged") ||
+        (command.action === "cast" && info.traits.includes("attack") && !command.options?.melee);
       this.offerReactions({ kind: "action", actor: actor.id, action: info.name, traits: info.traits, ranged, context });
     }
     if (this.finished || !this.canAct(actor.id)) return;
@@ -794,6 +922,18 @@ export class Encounter {
         return this.trip(actor, this.creature(command.target), map);
       case "escape":
         return this.escape(actor, this.creature(command.from), map);
+      case "cast": {
+        const def = SPELLS.get(command.spell)!;
+        const targets = (command.targets ?? []).map((id) => this.creature(id)).filter((t) => !t.dead);
+        def.cast(this.spellHost(actor, def, castRank, map), {
+          caster: actor,
+          rank: castRank,
+          actions: info.cost,
+          targets,
+          options: command.options ?? {},
+        });
+        return;
+      }
       case "ready": {
         const readied = command.readied;
         const readiedMap = actionInfo(actor, readied).traits.includes("attack")
@@ -848,18 +988,36 @@ export class Encounter {
     return succeeded(result.degree);
   }
 
+  /**
+   * Sure strike on the attacker: this attack roll is a fortune roll, ignores
+   * circumstance penalties and skips concealed/hidden flat checks. Used up by it.
+   * https://2e.aonprd.com/Spells.aspx?ID=1709
+   */
+  private takeSureStrike(attacker: Creature): boolean {
+    const effect = this.effects.find((e) => e.target === attacker.id && e.tags.includes("sure-strike"));
+    if (effect) this.endEffect(effect, "removed");
+    return effect !== undefined;
+  }
+
+  private rollAttack(attacker: Creature, target: Creature, modifiers: Modifier[], options: { adjusters?: DegreeAdjuster[] } = {}): CheckResult | null {
+    const sure = this.takeSureStrike(attacker);
+    if (!sure && !this.targetingCheck(attacker, target)) return null;
+    const mods = sure ? modifiers.filter((m) => !(m.type === "circumstance" && m.value < 0)) : modifiers;
+    return rollCheck(this.rng, mods, this.armorClass(target.id, attacker.id), { fortune: sure, ...(options.adjusters ? { adjusters: options.adjusters } : {}) });
+  }
+
   private resolveStrike(attacker: Creature, target: Creature, profile: StrikeProfile, map: number, reaction: boolean): StrikeResult | null {
-    if (!this.targetingCheck(attacker, target)) return null;
     const modifiers: Modifier[] = [
       ...profile.attack,
-      ...this.situational(attacker.id, "attack", { kind: "attack", attribute: profile.attackAttribute, range: profile.range }, target.id),
+      ...this.situational(attacker.id, "attack", { kind: "attack", attribute: profile.attackAttribute, range: profile.range }, target.id, profile.name),
     ];
     if (map !== 0) modifiers.push({ label: "multiple attack penalty", type: "untyped", value: map });
     if (profile.range === "ranged" && profile.rangeIncrement) {
       const penalty = rangePenalty(this.space.distance(attacker.id, target.id), profile.rangeIncrement) ?? 0;
       if (penalty !== 0) modifiers.push({ label: "range penalty", type: "untyped", value: penalty });
     }
-    const check = rollCheck(this.rng, modifiers, this.armorClass(target.id, attacker.id));
+    const check = this.rollAttack(attacker, target, modifiers);
+    if (!check) return null;
     const base = { attacker: attacker.id, target: target.id, weapon: profile.name, map, check };
     this.emit({ kind: "attack-roll", attacker: attacker.id, target: target.id, weapon: profile.name, check, reaction });
 
@@ -869,13 +1027,19 @@ export class Encounter {
       return result;
     }
 
+    // A Runic Weapon (or similar) can raise the number of weapon damage dice.
+    const dice = Math.max(
+      profile.damage.dice,
+      ...this.effects.filter((e) => e.target === attacker.id && e.weaponDice?.strike === profile.name).map((e) => e.weaponDice!.dice),
+    );
     const damageProfile: StrikeProfile = {
       ...profile,
       damage: {
         ...profile.damage,
+        dice,
         modifiers: [
           ...profile.damage.modifiers,
-          ...this.situational(attacker.id, "damage", { kind: "damage", attribute: profile.damageAttribute }, target.id),
+          ...this.situational(attacker.id, "damage", { kind: "damage", attribute: profile.damageAttribute }, target.id, profile.name),
         ],
       },
     };
@@ -883,8 +1047,8 @@ export class Encounter {
     const defended = applyDefenses([{ type: profile.damage.type, amount: damage.total }], target.defenses);
 
     const pending: { amount: number; block?: ShieldBlockResult } = { amount: defended.total };
-    if (pending.amount > 0 && (PHYSICAL_TYPES as readonly string[]).includes(profile.damage.type)) {
-      this.offerReactions({ kind: "incoming-damage", actor: attacker.id, target: target.id, type: profile.damage.type, pending });
+    if (pending.amount > 0) {
+      this.offerReactions({ kind: "incoming-damage", actor: attacker.id, target: target.id, types: [profile.damage.type], attack: true, magical: false, pending });
     }
 
     const hp = applyDamage(target, pending.amount);
@@ -945,7 +1109,7 @@ export class Encounter {
       this.addCondition(target.id, { slug: "prone" });
       if (degree === CRITICAL_SUCCESS) {
         const rolled = sum(rollDice(this.rng, 1, 6));
-        this.dealDamage(target, [{ type: "bludgeoning", amount: rolled }], actor.id, { critical: true });
+        this.dealDamage(target, [{ type: "bludgeoning", amount: rolled }], "Trip", { critical: true, attack: true, attacker: actor.id });
       }
     } else if (degree === CRITICAL_FAILURE) {
       this.addCondition(actor.id, { slug: "prone" });
@@ -988,13 +1152,77 @@ export class Encounter {
 
   // ---- damage, dying and death --------------------------------------------
 
-  /** Apply damage that isn't from a Strike: IWR, then HP, then dying or death. */
-  dealDamage(target: Creature, instances: readonly DamageInstance[], source: string, options: { critical: boolean; nonlethal?: boolean }): void {
+  /**
+   * Apply damage that isn't from a Strike: IWR, then reactions that reduce it
+   * (Shield Block against attacks; the shield spell against magic), then HP,
+   * then dying or death.
+   */
+  dealDamage(
+    target: Creature,
+    instances: readonly DamageInstance[],
+    source: string,
+    options: { critical: boolean; nonlethal?: boolean; attack?: boolean; magical?: boolean; attacker?: string },
+  ): void {
     if (target.dead) return;
     const defended = applyDefenses(instances, target.defenses);
-    const hp = applyDamage(target, defended.total);
-    this.emit({ kind: "damage", creature: target.id, source, instances: defended.instances, total: defended.total, hp });
-    this.afterDamage(target, hp, defended.total, options);
+    const pending: { amount: number; block?: ShieldBlockResult } = { amount: defended.total };
+    if (pending.amount > 0 && options.attacker && (options.attack || options.magical)) {
+      this.offerReactions({
+        kind: "incoming-damage",
+        actor: options.attacker,
+        target: target.id,
+        types: defended.instances.filter((i) => i.amount > 0).map((i) => i.type),
+        attack: options.attack ?? false,
+        magical: options.magical ?? false,
+        pending,
+      });
+    }
+    const hp = applyDamage(target, pending.amount);
+    this.emit({ kind: "damage", creature: target.id, source, instances: defended.instances, total: pending.amount, hp });
+    this.afterDamage(target, hp, pending.amount, options);
+  }
+
+  /** What a spell can do, bound to its caster, rank and multiple attack penalty. */
+  private spellHost(caster: Creature, def: SpellDefinition, rank: number, map: number): SpellHost {
+    const sc = caster.spellcasting!;
+    // Incapacitation: a creature of more than twice the spell's rank gets one degree
+    // better on its check, or the caster's check against it is one degree worse.
+    // https://2e.aonprd.com/Traits.aspx?ID=631
+    const tooStrong = (t: Creature) => def.traits.includes("incapacitation") && t.level > 2 * rank;
+    return {
+      rollDice: (count, sides) => rollDice(this.rng, count, sides),
+      spellAttack: (target, range) => {
+        // https://2e.aonprd.com/Rules.aspx?ID=2292 (Spell Attack Rolls)
+        const mods: Modifier[] = [...sc.attack, ...this.situational(caster.id, "attack", { kind: "attack", attribute: sc.attribute, range }, target.id)];
+        if (map !== 0) mods.push({ label: "multiple attack penalty", type: "untyped", value: map });
+        const check = this.rollAttack(caster, target, mods, tooStrong(target) ? { adjusters: [() => -1] } : {});
+        if (!check) return null;
+        this.emit({ kind: "attack-roll", attacker: caster.id, target: target.id, weapon: def.name, check, reaction: false });
+        return check.degree;
+      },
+      save: (target, save) => {
+        const mods = [...target.saves[save], ...this.situational(target.id, save, { kind: "save", save }, caster.id)];
+        const check = rollCheck(this.rng, mods, this.spellDC(caster.id, target.id), tooStrong(target) ? { adjusters: [() => 1] } : {});
+        this.emit({ kind: "save", creature: target.id, spell: def.name, save, check });
+        return check.degree;
+      },
+      damage: (target, instances, o) =>
+        this.dealDamage(target, instances, def.name, {
+          critical: o.critical,
+          nonlethal: o.nonlethal ?? def.traits.includes("nonlethal"),
+          attack: o.attack,
+          magical: true,
+          attacker: caster.id,
+        }),
+      heal: (target, amount) => this.heal(target.id, amount),
+      addCondition: (target, condition) => this.addCondition(target.id, condition),
+      addEffect: ({ target, ...effect }) => void this.addEffect({ ...effect, source: caster.id, target: target.id }),
+      immunize: (creature, spell) => {
+        const set = this.spellImmunities.get(creature.id) ?? new Set<string>();
+        set.add(spell);
+        this.spellImmunities.set(creature.id, set);
+      },
+    };
   }
 
   /**
@@ -1266,9 +1494,12 @@ export class Encounter {
     }
 
     // Shield Block: shield raised, about to take physical damage from an attack.
+    const physical = trigger.kind === "incoming-damage" && trigger.types.some((t) => (PHYSICAL_TYPES as readonly string[]).includes(t));
     if (
       reactor.reactions.includes("shield-block") &&
       trigger.kind === "incoming-damage" &&
+      trigger.attack &&
+      physical &&
       trigger.target === reactor.id &&
       reactor.shield &&
       !isBroken(reactor.shield) &&
@@ -1289,6 +1520,26 @@ export class Encounter {
               this.endEffect(e, "removed");
             }
           }
+        },
+      });
+    }
+
+    // The shield spell's Shield Block: Hardness 5, against attacks' physical damage
+    // or any spell or magical effect. Then the spell ends, and it can't be cast
+    // again for 10 minutes. https://2e.aonprd.com/Spells.aspx?ID=1671
+    const magicShield = this.effects.find((e) => e.target === reactor.id && e.tags.includes("shield-spell"));
+    if (magicShield && trigger.kind === "incoming-damage" && trigger.target === reactor.id && ((trigger.attack && physical) || trigger.magical)) {
+      choices.push({
+        reaction: "shield-spell",
+        label: "Shield Block with the shield spell",
+        resolve: () => {
+          const prevented = Math.min(magicShield.data?.hardness ?? 5, trigger.pending.amount);
+          trigger.pending.amount -= prevented;
+          this.emit({ kind: "spell-shield-block", creature: reactor.id, prevented, remaining: trigger.pending.amount });
+          this.endEffect(magicShield, "removed");
+          const set = this.spellImmunities.get(reactor.id) ?? new Set<string>();
+          set.add("shield");
+          this.spellImmunities.set(reactor.id, set);
         },
       });
     }
@@ -1333,6 +1584,8 @@ export class Encounter {
     duration: Duration;
     modifiers?: readonly EffectModifier[];
     conditions?: readonly Condition[];
+    weaponDice?: { strike: string; dice: number };
+    data?: Readonly<Record<string, number>>;
     tags?: readonly string[];
   }): Effect {
     const created: Effect = {
@@ -1343,6 +1596,8 @@ export class Encounter {
       duration: effect.duration,
       modifiers: effect.modifiers ?? [],
       conditions: effect.conditions ?? [],
+      ...(effect.weaponDice ? { weaponDice: effect.weaponDice } : {}),
+      ...(effect.data ? { data: effect.data } : {}),
       tags: effect.tags ?? [],
     };
     this.effects.push(created);

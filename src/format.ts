@@ -36,7 +36,7 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
       return [`  ${name(event.creature)} Delayed a full round; that turn is lost`];
     case "action":
       // Strikes and checks print their own lines; other actions are listed here.
-      return /^(Strike|Grapple|Trip|Escape)/.test(event.action)
+      return /^(Strike|Grapple|Trip|Escape|Cast )/.test(event.action)
         ? []
         : [`    ${name(event.creature)}: ${event.action}${event.reaction ? " (reaction)" : ""}`];
     case "move":
@@ -51,6 +51,16 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
     }
     case "strike":
       return formatDamage(event.result);
+    case "cast": {
+      const targets = event.targets.length ? ` at ${event.targets.map(name).join(", ")}` : "";
+      return [`    ${name(event.creature)} casts ${event.spell} (rank ${event.rank}, ${event.actions} action${event.actions === 1 ? "" : "s"})${targets}`];
+    }
+    case "save": {
+      const c = event.check;
+      return [`      ${name(event.creature)} ${event.save} save vs ${event.spell}: d20 ${c.die} ${formatModifier(c.modifier)} = ${c.total} vs DC ${c.dc} -> ${DEGREE_NAMES[c.degree]}`];
+    }
+    case "spell-shield-block":
+      return [`      shield spell prevents ${event.prevented}; ${event.remaining} gets through; the spell ends`];
     case "skill-check": {
       const c = event.check;
       const mods = c.modifiers.map((m) => `${m.label} ${formatModifier(m.value)}${m.enabled ? "" : " (suppressed)"}`).join(", ");
@@ -149,6 +159,8 @@ function describeCommand(c: SingleCommand, name: (id: string) => string): string
       return `a Trip against ${name(c.target)}`;
     case "escape":
       return `an Escape from ${name(c.from)}`;
+    case "cast":
+      return `to Cast ${c.spell}`;
   }
 }
 

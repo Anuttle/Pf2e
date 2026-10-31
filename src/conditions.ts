@@ -15,6 +15,7 @@ export type ConditionSlug =
   | "drained"
   | "dying"
   | "enfeebled"
+  | "fleeing"
   | "frightened"
   | "grabbed"
   | "hidden"
@@ -135,7 +136,9 @@ export type RollContext =
   | { kind: "ac" }
   | { kind: "save"; save: "fortitude" | "reflex" | "will"; dc?: boolean }
   | { kind: "perception"; dc?: boolean }
-  | { kind: "skill"; skill: Skill; dc?: boolean };
+  | { kind: "skill"; skill: Skill; dc?: boolean }
+  /** A spell DC: a DC based on the casting attribute. */
+  | { kind: "spell-dc"; attribute: Attribute };
 
 const SAVE_ATTRIBUTE = { fortitude: "con", reflex: "dex", will: "wis" } as const;
 const SKILL_ATTRIBUTE: Record<Skill, Attribute> = { athletics: "str", acrobatics: "dex" };
@@ -153,6 +156,8 @@ function attributeOf(ctx: RollContext): Attribute | null {
       return "wis";
     case "skill":
       return SKILL_ATTRIBUTE[ctx.skill];
+    case "spell-dc":
+      return ctx.attribute;
   }
 }
 

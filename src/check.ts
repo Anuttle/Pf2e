@@ -58,6 +58,8 @@ export function applyAdjusters(degree: Degree, adjusters: readonly DegreeAdjuste
 
 export interface CheckResult {
   die: number;
+  /** Both d20s when a fortune effect rolled twice; the better one is `die`. */
+  rolls?: readonly number[];
   modifier: number;
   total: number;
   dc: number;
@@ -67,6 +69,8 @@ export interface CheckResult {
 
 export interface CheckOptions {
   adjusters?: readonly DegreeAdjuster[];
+  /** Roll twice and use the better result. https://2e.aonprd.com/Traits.aspx?ID=612 */
+  fortune?: boolean;
 }
 
 export function rollCheck(
@@ -76,10 +80,11 @@ export function rollCheck(
   options: CheckOptions = {},
 ): CheckResult {
   const stacked = stackModifiers(modifiers);
-  const die = rollDie(rng, 20);
+  const rolls = options.fortune ? [rollDie(rng, 20), rollDie(rng, 20)] : [rollDie(rng, 20)];
+  const die = Math.max(...rolls);
   const total = die + stacked.total;
   const degree = applyAdjusters(degreeWithNatural(total, dc, die), options.adjusters ?? []);
-  return { die, modifier: stacked.total, total, dc, degree, modifiers: stacked.modifiers };
+  return { die, ...(options.fortune ? { rolls } : {}), modifier: stacked.total, total, dc, degree, modifiers: stacked.modifiers };
 }
 
 export interface FlatCheckResult {
