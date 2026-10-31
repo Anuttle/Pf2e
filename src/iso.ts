@@ -34,7 +34,25 @@ export interface IsoOptions {
    * reads as a room. Height in feet; 0 turns it off. Default 15.
    */
   backdrop?: number;
+  /** Creatures caught mid-step, drawn between two squares with a walking pose. */
+  motion?: ReadonlyMap<string, Motion>;
 }
+
+/**
+ * A creature partway through a one-square step from `from` to its token's
+ * current square. The view CLI animates a move by rendering frames with
+ * `progress` going from 0 to 1 and `step` counting frames for the leg cycle.
+ */
+export interface Motion {
+  from: Position;
+  /** 0 at `from`, 1 on the token's square. */
+  progress: number;
+  /** Frame counter; picks the walking pose. */
+  step: number;
+}
+
+/** Leg poses for a walk cycle, under the arms `/|\`. */
+export const WALK_CYCLE = ["/ \\", " |\\", " | ", "/| "] as const;
 
 export interface IsoView {
   lines: string[];
@@ -141,6 +159,17 @@ interface Scene {
   mid: string;
   /** Backdrop height in rows. */
   backdrop: number;
+  figures: readonly Figure[];
+}
+
+/** A creature to draw, on its square or between two. Positions are in the rotated frame. */
+interface Figure {
+  id: string;
+  label: string;
+  color: Color;
+  down: boolean;
+  to: Position;
+  from?: { rot: Position; elevation: number; progress: number; step: number };
 }
 
 export function renderIsometric(map: BattleMap, creatures: readonly Creature[], options: IsoOptions = {}): IsoView {
@@ -178,19 +207,39 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
     rowsPerStep: options.rowsPerStep ?? 2,
     mid: options.ascii ? "-" : "·",
     backdrop: Math.round(((options.backdrop ?? 15) / 5) * (options.rowsPerStep ?? 2)),
+    figures: tiles
+      .filter((t) => t.token)
+      .map((t): Figure => {
+        const id = t.token!;
+        const c = creatures.find((k) => k.id === id);
+        const label = labels.get(id) ?? "?";
+        const m = options.motion?.get(id);
+        const fromSquare = m && squareAt(map, m.from);
+        return {
+          id,
+          label,
+          color: figureColor(c, label),
+          down: !!c?.down,
+          to: t.rot,
+          from:
+            m && fromSquare && !c?.down && m.progress < 1
+              ? { rot: rotate(m.from, map, rotation), elevation: fromSquare.elevation, progress: Math.max(0, m.progress), step: m.step }
+              : undefined,
+        };
+      }),
   };
 
   // Paint, then flatten whatever hides the viewer or another creature's head, until all show.
   let canvas = paint(scene);
   for (let guard = 0; cutaway && guard < tiles.length; guard++) {
     const blockers = new Set<Tile>();
-    for (const [i, t] of tiles.entries()) {
-      if (!t.token) continue;
-      for (const owner of canvas.figureOwners(i)) {
+    scene.figures.forEach((_, f) => {
+      const { tile, owners } = canvas.figureOwners(f);
+      for (const owner of owners) {
         const blocker = tiles[owner];
-        if (blocker && owner !== i && lift(scene, blocker) > 0) blockers.add(blocker);
+        if (blocker && owner !== tile && lift(scene, blocker) > 0) blockers.add(blocker);
       }
-    }
+    });
     if (blockers.size === 0) break;
     for (const b of blockers) scene.flattened.add(b);
     canvas = paint(scene);
@@ -248,8 +297,11 @@ function corner(u: number, v: number, h: number): Pt {
 
 interface Canvas {
   lines(color: boolean): string[];
-  /** Tile indices owning the cells of tile i's figure: all of it for the viewer, the head for others. */
-  figureOwners(i: number): number[];
+  /**
+   * For figure f: the tile it was painted with, and the tiles now owning its
+   * watched cells (all of the viewer's figure, the head of anyone else).
+   */
+  figureOwners(f: number): { tile: number; owners: number[] };
 }
 
 function paint(scene: Scene): Canvas {
@@ -266,8 +318,9 @@ function paint(scene: Scene): Canvas {
         minY = Math.min(minY, y); maxY = Math.max(maxY, y);
       }
     }
-    if (t.token) minY = Math.min(minY, corner(u, v, lift(scene, t))[1] - 1.5);
   }
+  const placed = scene.figures.map((f) => placeFigure(scene, f));
+  for (const p of placed) minY = Math.min(minY, p.row - 2.5);
   const frame = viewFrame(tiles);
   if (frame && scene.backdrop > 0) minY = Math.min(minY, corner(frame.u0, frame.v0, scene.backdrop)[1]);
   // A corner on a row boundary draws its `_` in the row above.
@@ -315,6 +368,8 @@ function paint(scene: Scene): Canvas {
   };
 
   const watchedCells = new Map<number, [col: number, row: number][]>();
+  const tileIndex = new Map(tiles.map((t, i) => [t, i]));
+  const paintAfter = placed.map((p) => (p.tile ? (tileIndex.get(p.tile) ?? -1) : -1));
 
   // Backdrop: posts at the view's left, back and right corners joined along
   // the top. Painted first, so everything on the map stands in front of it.
@@ -377,29 +432,28 @@ function paint(scene: Scene): Canvas {
     if (!sameSurface(scene, t, leftN)) line(S, W, i);
     if (!sameSurface(scene, t, scene.at(u - 1, v))) line(W, N, i);
 
-    // The figure stands in the middle of the top face: head (its label), body, legs.
-    if (t.token) {
-      const c = scene.byId.get(t.token);
-      const label = scene.labels.get(t.token) ?? "?";
-      const color = figureColor(c, label);
+    // Figures standing on (or stepping onto) this square, drawn after it so it can't cover them.
+    scene.figures.forEach((f, k) => {
+      if (paintAfter[k] !== i) return;
+      const { col, row } = placed[k]!;
       const watched: [number, number][] = [];
-      const draw = (dc: number, dr: number, s: string, isHead = false) => {
-        for (let k = 0; k < s.length; k++) {
-          if (s[k] === " ") continue;
-          put(center.col + dc + k, center.row + dr, s[k]!, i, color);
-          if (isHead || label === "@") watched.push([center.col + dc + k, center.row + dr]);
+      const draw = (dc: number, dr: number, text: string, isHead = false) => {
+        for (let n = 0; n < text.length; n++) {
+          if (text[n] === " ") continue;
+          put(col + dc + n, row + dr, text[n]!, i, f.color);
+          if (isHead || f.label === "@") watched.push([col + dc + n, row + dr]);
         }
       };
-      if (c?.down) {
-        draw(-1, 0, label, true);
-        draw(-1 + label.length, 0, "-<");
+      if (f.down) {
+        draw(-1, 0, f.label, true);
+        draw(-1 + f.label.length, 0, "-<");
       } else {
-        draw(0, -2, label, true);
+        draw(0, -2, f.label, true);
         draw(-1, -1, "/|\\");
-        draw(-1, 0, "/ \\");
+        draw(-1, 0, f.from ? WALK_CYCLE[f.from.step % WALK_CYCLE.length]! : WALK_CYCLE[0]);
       }
-      watchedCells.set(i, watched);
-    }
+      watchedCells.set(k, watched);
+    });
   });
 
   return {
@@ -420,9 +474,36 @@ function paint(scene: Scene): Canvas {
         return out.trimEnd();
       });
     },
-    figureOwners(i) {
-      return (watchedCells.get(i) ?? []).map(([c, r]) => owners[r - row0]?.[c - col0] ?? -1);
+    figureOwners(f) {
+      const cells = watchedCells.get(f) ?? [];
+      return { tile: paintAfter[f] ?? -1, owners: cells.map(([c, r]) => owners[r - row0]?.[c - col0] ?? -1) };
     },
+  };
+}
+
+/**
+ * Where a figure's feet go, and which tile paints it. A figure mid-step is
+ * placed between the two squares' centers and painted with whichever square
+ * is nearer the front, so neither square's floor covers it.
+ */
+function placeFigure(scene: Scene, f: Figure): { col: number; row: number; tile: Tile | undefined } {
+  const toTile = scene.at(f.to.x, f.to.y);
+  const center = (rot: Position, h: number) => {
+    const [x, y] = corner(rot.x, rot.y, h);
+    return { col: Math.floor(x), row: y };
+  };
+  const end = center(f.to, lift(scene, toTile));
+  if (!f.from) return { ...end, tile: toTile };
+  const fromTile = scene.at(f.from.rot.x, f.from.rot.y);
+  const fromLift = fromTile ? lift(scene, fromTile) : Math.round((f.from.elevation / 5) * scene.rowsPerStep);
+  const start = center(f.from.rot, fromLift);
+  const t = f.from.progress;
+  const depth = (p: Position) => p.x + p.y;
+  const front = !fromTile || depth(f.to) >= depth(f.from.rot) ? toTile : fromTile;
+  return {
+    col: Math.round(start.col + (end.col - start.col) * t),
+    row: Math.round(start.row + (end.row - start.row) * t),
+    tile: front,
   };
 }
 

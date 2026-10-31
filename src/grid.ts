@@ -104,3 +104,85 @@ export function placeToken(map: BattleMap, id: string, pos: Position): void {
 export function chebyshev(a: Position, b: Position): number {
   return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
 }
+
+// ---------------------------------------------------------------------------
+// Paths
+
+export interface PathOptions {
+  /** Stop once this many feet are spent; the path is cut at the last affordable square. */
+  maxFeet?: number;
+  /** Aim for any square next to `to` (as when closing to melee) rather than `to` itself. */
+  adjacent?: boolean;
+}
+
+export interface PathStep extends Position {
+  /** Feet spent from the start to reach this square. */
+  feet: number;
+}
+
+/** Extra feet to enter a square of this terrain; undefined if a walker cannot enter it. */
+function entryCost(terrain: Terrain): number | undefined {
+  switch (terrain) {
+    case "wall":
+    case "water": // needs a swim Speed or Athletics; not walked into
+      return undefined;
+    case "difficult":
+      return 5;
+    case "greater-difficult":
+      return 10;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Cheapest walking path from `from` toward `to`, excluding the start square.
+ * Each square costs 5 feet; every second diagonal costs 10; difficult terrain
+ * adds 5 and greater difficult terrain adds 10. Walls, water and other
+ * creatures' squares block. Returns [] when there is no way through.
+ * https://2e.aonprd.com/Rules.aspx?ID=2357 (Diagonal Movement)
+ * https://2e.aonprd.com/Rules.aspx?ID=2366 (Difficult Terrain)
+ */
+export function findPath(map: BattleMap, from: Position, to: Position, options: PathOptions = {}): PathStep[] {
+  const occupied = new Set([...map.tokens.values()].map((p) => `${p.x},${p.y}`));
+  const goal = (p: Position) => (options.adjacent ? chebyshev(p, to) === 1 : p.x === to.x && p.y === to.y);
+  if (goal(from)) return [];
+
+  // Dijkstra over (square, whether the next diagonal is the expensive one).
+  type Node = { x: number; y: number; odd: boolean; feet: number; prev?: Node };
+  const key = (x: number, y: number, odd: boolean) => `${x},${y},${odd}`;
+  const best = new Map<string, number>();
+  const open: Node[] = [{ ...from, odd: false, feet: 0 }];
+  best.set(key(from.x, from.y, false), 0);
+  let found: Node | undefined;
+  while (open.length) {
+    open.sort((a, b) => a.feet - b.feet);
+    const node = open.shift()!;
+    if (node.feet > (best.get(key(node.x, node.y, node.odd)) ?? Infinity)) continue;
+    if (goal(node)) {
+      found = node;
+      break;
+    }
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const next = { x: node.x + dx, y: node.y + dy };
+        const square = squareAt(map, next);
+        const extra = square && entryCost(square.terrain);
+        if (extra === undefined || occupied.has(`${next.x},${next.y}`)) continue;
+        const diagonal = dx !== 0 && dy !== 0;
+        const feet = node.feet + (diagonal && node.odd ? 10 : 5) + extra;
+        const odd = diagonal ? !node.odd : node.odd;
+        const k = key(next.x, next.y, odd);
+        if (feet >= (best.get(k) ?? Infinity)) continue;
+        best.set(k, feet);
+        open.push({ ...next, odd, feet, prev: node });
+      }
+    }
+  }
+  if (!found) return [];
+
+  const path: PathStep[] = [];
+  for (let n: Node | undefined = found; n?.prev; n = n.prev) path.unshift({ x: n.x, y: n.y, feet: n.feet });
+  return options.maxFeet === undefined ? path : path.filter((s) => s.feet <= options.maxFeet!);
+}

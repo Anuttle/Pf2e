@@ -88,6 +88,21 @@ describe("creatures and the player's view", () => {
     assert.match(text, /g-</);
   });
 
+  it("draws a creature mid-step between squares with a walking pose", () => {
+    const map = parseMap(["..."]);
+    placeToken(map, "valeros", { x: 1, y: 0 });
+    const at = (motion?: Map<string, { from: { x: number; y: number }; progress: number; step: number }>) =>
+      renderIsometric(map, [valeros()], { ...plain, focus: "valeros", motion }).lines;
+    const headCol = (lines: string[]) => lines.find((l) => l.includes("@"))!.indexOf("@");
+    const start = { from: { x: 0, y: 0 }, progress: 0, step: 1 };
+    // One step east is 4 columns right on screen; halfway is 2.
+    assert.equal(headCol(at(new Map([["valeros", { ...start, progress: 0.5 }]]))) - headCol(at(new Map([["valeros", start]]))), 2);
+    assert.equal(headCol(at(new Map([["valeros", { ...start, progress: 1 }]]))), headCol(at()));
+    // Legs follow the walk cycle; a creature at rest stands with legs apart.
+    assert.match(at(new Map([["valeros", { ...start, progress: 0.5 }]])).join("\n"), / \|\\/);
+    assert.match(at().join("\n"), /\/ \\/);
+  });
+
   it("colours figures and terrain only when asked", () => {
     const map = parseMap([".~"]);
     placeToken(map, "valeros", { x: 0, y: 0 });
