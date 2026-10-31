@@ -85,5 +85,7 @@ describe("tokens and the player's view", () => {
     placeToken(map, "g", { x: 1, y: 0 });
     const { legend } = renderIsometric(map, [v, g], { focus: "valeros" });
     assert.deepEqual(legend, ["@  Valeros (you)  HP 20/20 +3 temp  10 ft up", "g  Goblin Warrior  HP 6/6  down"]);
+    g.dead = true;
+    assert.equal(renderIsometric(map, [v, g], { focus: "valeros" }).legend[1], "g  Goblin Warrior  HP 6/6  dead");
   });
 });

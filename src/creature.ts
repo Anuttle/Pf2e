@@ -1,9 +1,11 @@
 // Creatures: player characters built from attributes and proficiency, and
 // monsters copied from stat blocks. Both end up as the same Creature shape.
 
+import type { Attribute, Condition, Skill } from "./conditions.ts";
 import type { DieSize } from "./dice.ts";
 import { type DamageDefenses, type DamageType, NO_DEFENSES } from "./damage.ts";
 import type { Modifier } from "./modifiers.ts";
+import { type ShieldData, type ShieldState, wieldShield } from "./shields.ts";
 import { type Weapon, type WeaponRunes, NO_RUNES, deadlyDiceCount, traitValue, weaponDiceCount } from "./weapons.ts";
 
 export interface Attributes {
@@ -27,6 +29,11 @@ export interface StrikeProfile {
   name: string;
   range: "melee" | "ranged";
   traits: readonly string[];
+  /** Feet. Ranged attacks take −2 per increment past the first, up to 6 increments. */
+  rangeIncrement?: number;
+  /** Attribute behind the attack roll and the damage roll, for conditions like clumsy and enfeebled. */
+  attackAttribute: Attribute;
+  damageAttribute: Attribute | null;
   attack: readonly Modifier[];
   damage: {
     dice: number;
@@ -40,6 +47,9 @@ export interface StrikeProfile {
 
 export type SaveType = "fortitude" | "reflex" | "will";
 
+/** Reactions the engine knows how to offer. */
+export type ReactionSlug = "reactive-strike" | "shield-block";
+
 export interface Creature {
   id: string;
   name: string;
@@ -51,7 +61,25 @@ export interface Creature {
   saves: Readonly<Record<SaveType, readonly Modifier[]>>;
   defenses: DamageDefenses;
   strikes: readonly StrikeProfile[];
-  /** True once the creature drops to 0 HP. Dying rules arrive in milestone 4. */
+  /** Land Speed in feet. */
+  speed: number;
+  /** Melee reach in feet. Weapons with the reach trait add to it. */
+  reach: number;
+  reactions: readonly ReactionSlug[];
+  shield?: ShieldState;
+  skills: Readonly<Partial<Record<Skill, readonly Modifier[]>>>;
+  /** Hands not holding anything, for Grapple and Trip. */
+  freeHands: number;
+  /** Conditions applied directly to the creature (effects can grant more). */
+  conditions: Condition[];
+  /**
+   * PCs and significant foes get knocked out and start dying at 0 HP; most
+   * monsters die. https://2e.aonprd.com/Rules.aspx?ID=2324
+   */
+  usesDyingRules: boolean;
+  heroPoints: number;
+  dead: boolean;
+  /** Out of the fight: dead or unconscious. Kept up to date by the encounter. */
   down: boolean;
 }
 
@@ -84,6 +112,12 @@ export interface CharacterSpec {
   perceptionRank: ProficiencyRank;
   saveRanks: Record<SaveType, ProficiencyRank>;
   weapons: readonly WieldedWeapon[];
+  skillRanks?: Partial<Record<Skill, ProficiencyRank>>;
+  freeHands?: number;
+  heroPoints?: number;
+  speed?: number;
+  shield?: ShieldData;
+  reactions?: readonly ReactionSlug[];
   side?: Creature["side"];
 }
 
@@ -125,6 +159,9 @@ export function weaponStrike(spec: CharacterSpec, wielded: WieldedWeapon): Strik
     name: weapon.name,
     range: weapon.range,
     traits,
+    ...(weapon.rangeIncrement ? { rangeIncrement: weapon.rangeIncrement } : {}),
+    attackAttribute: attackAttr.label.startsWith("Dex") ? "dex" : "str",
+    damageAttribute: damageMods.length ? "str" : null,
     attack,
     damage: {
       dice: weaponDiceCount(runes),
@@ -157,6 +194,19 @@ export function buildCharacter(spec: CharacterSpec): Creature {
     },
     defenses: NO_DEFENSES,
     strikes: spec.weapons.map((w) => weaponStrike(spec, w)),
+    speed: spec.speed ?? 25,
+    reach: 5,
+    reactions: spec.reactions ?? [],
+    ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
+    skills: {
+      athletics: [attr("Str", a.str), prof(spec.skillRanks?.athletics ?? 0, level)],
+      acrobatics: [attr("Dex", a.dex), prof(spec.skillRanks?.acrobatics ?? 0, level)],
+    },
+    freeHands: spec.freeHands ?? 0,
+    conditions: [],
+    usesDyingRules: true,
+    heroPoints: spec.heroPoints ?? 1,
+    dead: false,
     down: false,
   };
 }
@@ -169,6 +219,7 @@ export interface MonsterStrikeSpec {
   range: "melee" | "ranged";
   attackBonus: number;
   traits?: readonly string[];
+  rangeIncrement?: number;
   damage: { dice: number; die: DieSize; bonus?: number; type: DamageType };
 }
 
@@ -181,6 +232,14 @@ export interface MonsterSpec {
   perception: number;
   saves: Record<SaveType, number>;
   strikes: readonly MonsterStrikeSpec[];
+  speed?: number;
+  reach?: number;
+  reactions?: readonly ReactionSlug[];
+  shield?: ShieldData;
+  skills?: Partial<Record<Skill, number>>;
+  freeHands?: number;
+  /** Villains and important foes may use the PC dying rules. */
+  usesDyingRules?: boolean;
   defenses?: DamageDefenses;
   side?: Creature["side"];
 }
@@ -211,6 +270,11 @@ export function buildMonster(spec: MonsterSpec): Creature {
         name: s.name,
         range: s.range,
         traits,
+        ...(s.rangeIncrement ? { rangeIncrement: s.rangeIncrement } : {}),
+        // Stat blocks don't say; assume Str for melee, Dex for finesse and ranged,
+        // Str damage for melee and thrown.
+        attackAttribute: s.range === "ranged" || traits.includes("finesse") ? "dex" : "str",
+        damageAttribute: s.range === "melee" || traits.includes("thrown") ? "str" : null,
         attack: [base("stat block", s.attackBonus)],
         damage: {
           dice: s.damage.dice,
@@ -221,6 +285,16 @@ export function buildMonster(spec: MonsterSpec): Creature {
         },
       };
     }),
+    speed: spec.speed ?? 25,
+    reach: spec.reach ?? 5,
+    reactions: spec.reactions ?? [],
+    ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
+    skills: Object.fromEntries(Object.entries(spec.skills ?? {}).map(([k, v]) => [k, [base("stat block", v)]])),
+    freeHands: spec.freeHands ?? 0,
+    conditions: [],
+    usesDyingRules: spec.usesDyingRules ?? false,
+    heroPoints: 0,
+    dead: false,
     down: false,
   };
 }

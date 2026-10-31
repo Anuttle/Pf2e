@@ -173,7 +173,8 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
     if (!t) continue;
     const parts = [(labels.get(c.id) ?? "?").padEnd(3) + c.name + (c.id === options.focus ? " (you)" : "")];
     parts.push(`HP ${c.hp.current}/${c.hp.max}${c.hp.temp ? ` +${c.hp.temp} temp` : ""}`);
-    if (c.down) parts.push("down");
+    if (c.dead) parts.push("dead");
+    else if (c.down) parts.push("down");
     if (t.elevation > 0) parts.push(`${t.elevation} ft up`);
     legend.push(parts.join("  "));
   }

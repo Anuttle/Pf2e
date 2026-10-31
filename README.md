@@ -4,15 +4,22 @@ A headless, deterministic rules engine for Pathfinder Second Edition (Remaster) 
 
 ## Status
 
-Milestones 1–2 of the design doc are in:
+Milestones 1–4 of the design doc are in:
 
 - **Dice and checks**: seeded dice, modifier stacking, proficiency, the four degrees of success, natural 1/20, degree adjusters, flat checks.
-- **Strike loop**: character and monster statistics, AC, multiple attack penalty (agile), damage rolls (minimum 1, crit doubling, deadly, fatal, striking runes), immunity / weakness / resistance, temporary HP, massive damage.
-- **Battle**: initiative (enemies win ties), rounds, three Strikes a turn, a full replayable log.
+- **Strike loop**: character and monster statistics, AC, multiple attack penalty (agile), range increments, damage rolls (minimum 1, crit doubling, deadly, fatal, striking runes), immunity / weakness / resistance, temporary HP, massive damage.
+- **Encounter and turns**: initiative (enemies win ties), the three-action turn, actions with traits (Strike, Stride, Step, Raise a Shield, Interact, Sustain, Ready), reactions (Reactive Strike with disruption, Shield Block, readied actions), effect durations (rounds, until a turn starts or ends, through N turns, sustained), Delay with returns and lost turns, and a full replayable log.
+- **Conditions and dying**: off-guard, frightened, sickened, clumsy, enfeebled, stupefied, drained, doomed, wounded, prone, grabbed, restrained, immobilized, concealed, hidden, blinded, dazzled, unconscious, slowed, stunned, quickened and persistent damage, with implied conditions and overrides; Grapple, Trip, Escape, Stand, Crawl and Drop Prone; knocked out at 0 HP (initiative moves, dying 1 or 2 plus wounded), recovery checks, death at dying 4 minus doomed, massive damage, Hero Points to stabilize, healing, nonlethal knockouts, and monsters that die at 0 HP.
+- **Grid and isometric view (started)**: a map of 5-foot squares with terrain and elevation, token placement, and an isometric ASCII view drawn from the player's point of view (centered on their creature, view radius, four camera rotations, walls cut away when they would hide a creature). Not yet connected to the encounter engine, which still uses positions on a line.
 
-- **Grid and isometric view (started)**: a map of 5-foot squares with terrain and elevation, token placement, and an isometric ASCII view drawn from the player's point of view (centered on their creature, view radius, four camera rotations, walls cut away when they would hide a creature). Movement costs, cover and flanking are not wired in yet.
+Next up: the rest of milestone 5: wire the grid into the encounter engine (movement costs, flanking, cover, real reach and areas).
 
-Next up: milestone 3 (action economy, reactions, durations, Delay and Ready), then conditions and dying, then the grid.
+### Stand-ins until later milestones
+
+- **Positions are on a line**, in 5-foot squares, until the grid arrives in milestone 5. Reach, range, movement and every reaction trigger already work on it.
+- **Controllers are synchronous.** The engine calls a creature's controller for each action and each reaction offer (`src/encounter.ts`, `Controller`). The design doc's prompt-and-respond API for UIs can wrap this later.
+- **No reactions before a creature's first turn.** The rules leave that to the GM.
+- **Not yet**: size limits on Grapple and Trip, the free 5-foot Stride on a critical Escape, quickened's limits on its extra action, Retching and assisted recovery from persistent damage, and spells (stupefied's casting check waits for them).
 
 ## Usage
 
@@ -54,7 +61,13 @@ your token
 | `src/weapons.ts` | Weapon data and fundamental runes |
 | `src/creature.ts` | Character builder, monster stat blocks |
 | `src/strike.ts` | Multiple attack penalty, Strike, damage pipeline, HP |
-| `src/battle.ts` | Initiative and the round loop |
+| `src/encounter.ts` | Encounter engine: turns, actions, reactions, Delay, Ready |
+| `src/effects.ts` | Effects, durations, the modifiers and conditions they grant |
+| `src/conditions.ts` | Conditions, implied conditions and overrides, their modifiers |
+| `src/shields.ts` | Shields, Hardness, Shield Block |
+| `src/space.ts` | Positions on a line (stand-in for the grid) |
+| `src/ai.ts` | Default AI controller |
+| `src/battle.ts` | AI-vs-AI fights for the CLI and tests |
 | `src/format.ts` | Human-readable battle log |
 | `src/grid.ts` | Battle map: squares, terrain, elevation, tokens |
 | `src/iso.ts` | Isometric ASCII view for a player |
