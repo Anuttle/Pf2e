@@ -33,24 +33,32 @@ npm test            # unit tests, each tied to the rule it checks
 npm run typecheck
 npm run duel -- 42 3   # seed 42: Valeros (level 1 fighter) vs 3 goblin warriors
 npm run duel -- 42 5 valeros,ezren,kyra   # the whole party vs 5 goblins
-npm run view -- 0 4    # isometric view of the sample courtyard: rotation 0-3, radius 4
+npm run view -- 0 4    # isometric view of the sample courtyard: rotation 0-3, radius 4 (omit for the whole map)
 ```
 
 In a terminal, `npm run view` is interactive: `q`/`e` rotate the camera, `w`/`a`/`s`/`d` step Valeros along the grid (`w` is up-right on screen; free movement, no rules yet), `+`/`-` change the view radius, `x` quits.
 
 ### Reading the isometric view
 
-Each square is a diamond; one step along the map moves 4 columns and 2 rows. Raised squares rise one row per 5 feet and show a shaded left face (`:`) and a plain right face. `@` is you; other party members are capital letters and enemies lower-case letters, numbered when they share one. Fills: `#` wall, `"` difficult, `&` greater difficult, `^` hazardous, `~` water.
+Line art in true 2:1 isometric: an edge along the map climbs one row every four columns, drawn with glyphs at four heights in a cell (`' · . _`). Floors have no grid; lines appear only at the map's edge and where height or terrain changes. Raised squares (walls, ledges) are solid blocks, two rows tall per 5 feet, and neighbouring blocks of the same height merge into one. The two far sides of the view are drawn as see-through walls so the map reads as a room.
+
+Creatures are stick figures with their label as the head: `@` is you, other party members are capital letters, enemies lower-case letters, numbered when they share one. A downed creature lies flat (`g-<`). Terrain marks: `"` difficult, `&` greater difficult, `^` hazardous, `~` water. A wall that would hide a creature is cut down to the floor and marked `#`. In a terminal the view is in colour; pass `ascii: true` to `renderIsometric` to draw `·` as `-`.
+
+Valeros, a goblin, a 10-foot wall at the back, a pool and some difficult terrain:
 
 ```
-  .''.        .''.
-.' @  '.    .'####'.
-'.    .'    '.####.'
-  '..'      |:'..' |
-            '.:|  .'
-              '..'
-floor with    10-foot wall
-your token
+            _
+        _.·'|'·._
+    _.·'    |    '·._
+_.·'        |   _.·' '·._
+|           _   |'·._    '·._
+|       _.·'@'·.|    '·._.·'|
+|   _.·'   /|\  |       |   |
+_.·'    _  / \  _   g   |   |
+ '·._.·'~'·._    '·/|\  |   |
+     '·._   ~'·._  / \·._.·'
+         '·._.·'"'·._.·'
+             '·._.·'
 ```
 
 ## Layout

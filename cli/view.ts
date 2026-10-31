@@ -1,5 +1,5 @@
 // Isometric view of the sample courtyard from Valeros's point of view.
-// Usage: npm run view -- [rotation 0-3] [radius]
+// Usage: npm run view -- [rotation 0-3] [radius]   (no radius: the whole map)
 // In a terminal, keys: q/e rotate, w/a/s/d move Valeros (free movement, no
 // rules yet), +/- change the view radius, x quit.
 
@@ -8,18 +8,21 @@ import { inBounds, placeToken, squareAt } from "../src/grid.ts";
 import { type Rotation, formatIsoView, renderIsometric, rotate } from "../src/iso.ts";
 
 let rotation = Number(process.argv[2] ?? 0);
-let radius = Number(process.argv[3] ?? 4);
-if (![0, 1, 2, 3].includes(rotation) || !Number.isInteger(radius) || radius < 1) {
+let radius: number | undefined = process.argv[3] === undefined ? undefined : Number(process.argv[3]);
+if (![0, 1, 2, 3].includes(rotation) || (radius !== undefined && (!Number.isInteger(radius) || radius < 1))) {
   console.error("Usage: npm run view -- [rotation 0-3] [radius]");
   process.exit(1);
 }
 
 const { map, creatures } = goblinCourtyard(3);
 const focus = "valeros";
-const draw = () => formatIsoView(renderIsometric(map, creatures, { focus, rotation: rotation as Rotation, radius }));
+const color = !!process.stdout.isTTY;
+const draw = () => formatIsoView(renderIsometric(map, creatures, { focus, rotation: rotation as Rotation, radius, color }));
+const yellow = (s: string) => (color ? `\x1b[33m${s}\x1b[0m` : s);
+const title = color ? "\x1b[1mGOBLIN COURTYARD\x1b[0m" : "GOBLIN COURTYARD";
 
 if (!process.stdin.isTTY) {
-  console.log(draw());
+  console.log(`${title}\n\n${draw()}`);
   process.exit(0);
 }
 
@@ -38,7 +41,13 @@ function step(key: string): { x: number; y: number } | undefined {
 
 let message = "";
 const refresh = () => {
-  process.stdout.write("\x1b[2J\x1b[H" + draw() + "\n\nq/e rotate  w/a/s/d step along the grid (w = up-right)  +/- radius  x quit\n" + message + "\n");
+  const keys = [
+    "Keys: move   -> w a s d  (w = up-right on screen)",
+    "      rotate -> q e",
+    `      radius -> + -  (${radius === undefined ? "whole map" : radius})`,
+    "      exit   -> x",
+  ];
+  process.stdout.write(`\x1b[2J\x1b[H${title}\n\n${draw()}\n\n${keys.map(yellow).join("\n")}\n${message}\n`);
 };
 
 process.stdin.setRawMode(true);
@@ -51,8 +60,9 @@ process.stdin.on("data", (key: string) => {
   }
   if (key === "q") rotation = (rotation + 3) % 4;
   if (key === "e") rotation = (rotation + 1) % 4;
-  if (key === "+" || key === "=") radius += 1;
-  if (key === "-" && radius > 1) radius -= 1;
+  const largest = Math.max(map.width, map.height);
+  if (key === "+" || key === "=") radius = radius === undefined || radius + 1 >= largest ? undefined : radius + 1;
+  if (key === "-") radius = Math.max(1, (radius ?? largest) - 1);
   const d = step(key);
   if (d) {
     const here = map.tokens.get(focus)!;
