@@ -4,6 +4,7 @@
 import type { DieSize } from "./dice.ts";
 import { type DamageDefenses, type DamageType, NO_DEFENSES } from "./damage.ts";
 import type { Modifier } from "./modifiers.ts";
+import { type ShieldData, type ShieldState, wieldShield } from "./shields.ts";
 import { type Weapon, type WeaponRunes, NO_RUNES, deadlyDiceCount, traitValue, weaponDiceCount } from "./weapons.ts";
 
 export interface Attributes {
@@ -27,6 +28,8 @@ export interface StrikeProfile {
   name: string;
   range: "melee" | "ranged";
   traits: readonly string[];
+  /** Feet. Ranged attacks take −2 per increment past the first, up to 6 increments. */
+  rangeIncrement?: number;
   attack: readonly Modifier[];
   damage: {
     dice: number;
@@ -40,6 +43,9 @@ export interface StrikeProfile {
 
 export type SaveType = "fortitude" | "reflex" | "will";
 
+/** Reactions the engine knows how to offer. */
+export type ReactionSlug = "reactive-strike" | "shield-block";
+
 export interface Creature {
   id: string;
   name: string;
@@ -51,6 +57,12 @@ export interface Creature {
   saves: Readonly<Record<SaveType, readonly Modifier[]>>;
   defenses: DamageDefenses;
   strikes: readonly StrikeProfile[];
+  /** Land Speed in feet. */
+  speed: number;
+  /** Melee reach in feet. Weapons with the reach trait add to it. */
+  reach: number;
+  reactions: readonly ReactionSlug[];
+  shield?: ShieldState;
   /** True once the creature drops to 0 HP. Dying rules arrive in milestone 4. */
   down: boolean;
 }
@@ -84,6 +96,9 @@ export interface CharacterSpec {
   perceptionRank: ProficiencyRank;
   saveRanks: Record<SaveType, ProficiencyRank>;
   weapons: readonly WieldedWeapon[];
+  speed?: number;
+  shield?: ShieldData;
+  reactions?: readonly ReactionSlug[];
   side?: Creature["side"];
 }
 
@@ -125,6 +140,7 @@ export function weaponStrike(spec: CharacterSpec, wielded: WieldedWeapon): Strik
     name: weapon.name,
     range: weapon.range,
     traits,
+    ...(weapon.rangeIncrement ? { rangeIncrement: weapon.rangeIncrement } : {}),
     attack,
     damage: {
       dice: weaponDiceCount(runes),
@@ -157,6 +173,10 @@ export function buildCharacter(spec: CharacterSpec): Creature {
     },
     defenses: NO_DEFENSES,
     strikes: spec.weapons.map((w) => weaponStrike(spec, w)),
+    speed: spec.speed ?? 25,
+    reach: 5,
+    reactions: spec.reactions ?? [],
+    ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
     down: false,
   };
 }
@@ -169,6 +189,7 @@ export interface MonsterStrikeSpec {
   range: "melee" | "ranged";
   attackBonus: number;
   traits?: readonly string[];
+  rangeIncrement?: number;
   damage: { dice: number; die: DieSize; bonus?: number; type: DamageType };
 }
 
@@ -181,6 +202,10 @@ export interface MonsterSpec {
   perception: number;
   saves: Record<SaveType, number>;
   strikes: readonly MonsterStrikeSpec[];
+  speed?: number;
+  reach?: number;
+  reactions?: readonly ReactionSlug[];
+  shield?: ShieldData;
   defenses?: DamageDefenses;
   side?: Creature["side"];
 }
@@ -211,6 +236,7 @@ export function buildMonster(spec: MonsterSpec): Creature {
         name: s.name,
         range: s.range,
         traits,
+        ...(s.rangeIncrement ? { rangeIncrement: s.rangeIncrement } : {}),
         attack: [base("stat block", s.attackBonus)],
         damage: {
           dice: s.damage.dice,
@@ -221,6 +247,10 @@ export function buildMonster(spec: MonsterSpec): Creature {
         },
       };
     }),
+    speed: spec.speed ?? 25,
+    reach: spec.reach ?? 5,
+    reactions: spec.reactions ?? [],
+    ...(spec.shield ? { shield: wieldShield(spec.shield) } : {}),
     down: false,
   };
 }

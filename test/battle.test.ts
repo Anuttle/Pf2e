@@ -37,16 +37,17 @@ describe("battle", () => {
       assert.notEqual(result.winner, null, `seed ${seed} had no winner`);
       const losers = creatures.filter((c) => c.side !== result.winner);
       assert.ok(losers.every((c) => c.down && c.hp.current === 0));
-      assert.ok(formatBattle(result, creatures).some((line) => line.includes("Strike with")));
+      assert.ok(formatBattle(result, creatures).some((line) => line.includes("Strikes with")));
     }
   });
 
-  it("never makes more than three Strikes in a turn", () => {
+  it("never spends more than three actions in a turn", () => {
     const result = runBattle(99, party());
-    let strikes = 0;
+    let spent = 0;
     for (const e of result.events) {
-      if (e.kind === "turn") strikes = 0;
-      if (e.kind === "strike") assert.ok(++strikes <= 3);
+      if (e.kind === "turn-start") spent = 0;
+      if (e.kind === "action" && !e.reaction) spent += e.cost;
+      assert.ok(spent <= 3);
     }
   });
 

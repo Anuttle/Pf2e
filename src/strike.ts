@@ -9,6 +9,7 @@ import type { Creature, StrikeProfile } from "./creature.ts";
 import { type DefendedDamage, applyDefenses } from "./damage.ts";
 import { type Rng, rollDice, sum } from "./dice.ts";
 import { type Modifier, stackModifiers } from "./modifiers.ts";
+import type { ShieldBlockResult } from "./shields.ts";
 import { traitValue } from "./weapons.ts";
 
 /**
@@ -20,6 +21,17 @@ export function multipleAttackPenalty(priorAttacks: number, traits: readonly str
   const agile = traits.includes("agile");
   if (priorAttacks === 1) return agile ? -4 : -5;
   return agile ? -8 : -10;
+}
+
+/**
+ * Ranged attacks past the first range increment take −2 per extra increment,
+ * up to −10; beyond five extra increments the attack isn't possible (null).
+ * https://2e.aonprd.com/Rules.aspx?ID=2379 (Range and Reach)
+ */
+export function rangePenalty(distance: number, increment: number): number | null {
+  const increments = Math.max(1, Math.ceil(distance / increment));
+  if (increments > 6) return null;
+  return increments === 1 ? 0 : -2 * (increments - 1);
 }
 
 /** The target's Armor Class as a DC: 10 + its AC modifiers. */
@@ -111,6 +123,7 @@ export interface StrikeResult {
   damage: DamageRoll | null;
   defended: DefendedDamage | null;
   hp: HpChange | null;
+  shieldBlock?: ShieldBlockResult;
 }
 
 export function strike(input: StrikeInput): StrikeResult {
