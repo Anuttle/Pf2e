@@ -49,7 +49,8 @@ import { type Modifier, stackModifiers } from "./modifiers.ts";
 import { type ShieldBlockResult, isBroken, shieldBlock } from "./shields.ts";
 import { type CastOptions, type SpellDefinition, type SpellHost, actionRange, cantripRank, SPELLS } from "./spells.ts";
 import { type Area, type Direction, type Space, type Square, spaceDistance, spaceInArea, cornerDistance } from "./areas.ts";
-import { LineSpace, SQUARE } from "./space.ts";
+import { type BattleMap, type Position, entryCost, findPath } from "./grid.ts";
+import { type Cover, GridSpace, type Place, SQUARE, onOppositeSides, samePosition, toPosition, withinReach } from "./space.ts";
 import {
   type HpChange,
   type StrikeResult,
@@ -66,9 +67,13 @@ import {
 export type SingleCommand =
   /** `target` may be "trigger" for a readied Strike: the creature that set off the trigger. */
   | { action: "strike"; target: string; strike?: number }
-  | { action: "stride"; to: number }
-  | { action: "step"; to: number }
-  | { action: "crawl"; to: number }
+  /**
+   * Stride to a square, taking the cheapest route unless `path` lists every
+   * square to enter in order (ending at `to`), e.g. to skirt a foe's reach.
+   */
+  | { action: "stride"; to: Place; path?: readonly Place[] }
+  | { action: "step"; to: Place }
+  | { action: "crawl"; to: Place }
   | { action: "stand" }
   | { action: "drop-prone" }
   | { action: "raise-shield" }
@@ -163,8 +168,8 @@ interface ActionContext {
 /** Something that happened which a reaction might respond to. */
 export type Trigger =
   | { kind: "action"; actor: string; action: string; traits: readonly string[]; ranged: boolean; context: ActionContext }
-  | { kind: "leave-square"; actor: string; from: number; to: number }
-  | { kind: "enter-square"; actor: string; at: number }
+  | { kind: "leave-square"; actor: string; from: Position; to: Position }
+  | { kind: "enter-square"; actor: string; at: Position }
   | {
       kind: "incoming-damage";
       actor: string;
@@ -227,11 +232,12 @@ export type EncounterEvent =
   | { kind: "return"; creature: string; after: string }
   | { kind: "delayed-turn-lost"; creature: string }
   | { kind: "action"; creature: string; action: string; cost: number; traits: readonly string[]; reaction: boolean }
-  | { kind: "move"; creature: string; from: number; to: number; action: "stride" | "step" | "crawl" }
+  | { kind: "move"; creature: string; from: Position; to: Position; action: "stride" | "step" | "crawl" }
   /** A flat check: to target a concealed or hidden creature, to act while grabbed, to end persistent damage. */
   | { kind: "flat-check"; creature: string; purpose: string; result: FlatCheckResult }
   /** The attack roll, logged before any reactions to the hit. */
-  | { kind: "attack-roll"; attacker: string; target: string; weapon: string; check: CheckResult; reaction: boolean }
+  /** `position` lists what the grid did to the target's AC: "flanked", "standard cover", "lesser cover". */
+  | { kind: "attack-roll"; attacker: string; target: string; weapon: string; check: CheckResult; reaction: boolean; position: string[] }
   /** The whole Strike once damage (if any) is applied. */
   | { kind: "strike"; result: StrikeResult; reaction: boolean }
   | { kind: "skill-check"; creature: string; action: string; target: string; check: CheckResult }
@@ -301,8 +307,16 @@ export interface TurnState {
 export interface EncounterSetup {
   seed: number;
   creatures: Creature[];
-  /** Starting position of every creature, in feet along the line. */
-  positions: Readonly<Record<string, number>>;
+  /**
+   * The battle map to fight on: walls, terrain and edges apply, and the map's
+   * tokens follow the creatures. Without one the fight is on open floor.
+   */
+  map?: BattleMap;
+  /**
+   * Starting square of every creature: {x, y}, or feet along one row. May be
+   * left out when the map already has a token for each creature.
+   */
+  positions?: Readonly<Record<string, Place>>;
   controllers: Readonly<Record<string, Controller>> | ((creature: Creature) => Controller);
   maxRounds?: number;
   /** Use this initiative order instead of rolling (a GM override, or a test fixture). */
@@ -324,7 +338,7 @@ const GRAPPLE_TAG = "grapple";
 export class Encounter {
   readonly seed: number;
   readonly rng: Rng;
-  readonly space: LineSpace;
+  readonly space: GridSpace;
   readonly events: EncounterEvent[] = [];
   readonly effects: Effect[] = [];
   order: string[] = [];
@@ -353,7 +367,8 @@ export class Encounter {
     this.seed = setup.seed;
     this.rng = setup.rng ?? createRng(setup.seed);
     this.fixedInitiative = setup.initiative;
-    this.space = new LineSpace(setup.positions);
+    const map = setup.map ?? null;
+    this.space = new GridSpace(setup.positions ?? Object.fromEntries(map?.tokens ?? []), map);
     this.maxRounds = setup.maxRounds ?? 100;
     for (const c of setup.creatures) {
       if (!this.space.has(c.id)) throw new Error(`${c.id} has no starting position`);
@@ -441,16 +456,106 @@ export class Encounter {
     const me = this.creature(id);
     return this.effects
       .filter((e) => e.aura && this.creatures.has(e.target) && this.creature(e.target).side === me.side)
-      .filter((e) => e.target === id || spaceDistance(this.spaceOf(e.target), this.spaceOf(id)) <= e.aura!.radius)
+      .filter((e) => e.target === id || (spaceDistance(this.spaceOf(e.target), this.spaceOf(id)) <= e.aura!.radius && this.lineOfEffect(e.target, id)))
       .flatMap((e) => e.aura!.modifiers.filter((m) => m.selector === selector).map((m) => m.modifier));
   }
 
-  /**
-   * A creature's space in grid squares. Until the grid is wired in, everyone is
-   * Medium and stands on row 0 at x = feet / 5.
-   */
+  /** A creature's space in grid squares. Everyone occupies one square for now. */
   spaceOf(id: string): Space {
-    return { x: this.space.position(id) / SQUARE, y: 0, size: 1 };
+    return { ...this.space.position(id), size: 1 };
+  }
+
+  /** Is `target` within `reach` feet of `id`? https://2e.aonprd.com/Rules.aspx?ID=2379 */
+  inReach(id: string, target: string | Position, reach: number): boolean {
+    return withinReach(this.space.position(id), typeof target === "string" ? this.space.position(target) : target, reach);
+  }
+
+  /** No solid wall entirely between the two creatures. https://2e.aonprd.com/Rules.aspx?ID=2382 */
+  lineOfEffect(a: string, b: string): boolean {
+    return this.space.lineOfEffect(this.space.position(a), this.space.position(b));
+  }
+
+  /**
+   * Cover `target` has against `attacker`: standard behind a wall, lesser
+   * behind another standing creature. https://2e.aonprd.com/Rules.aspx?ID=2372
+   */
+  coverAgainst(target: string, attacker: string): Cover {
+    const others = this.all().filter((c) => !c.down && c.id !== target && c.id !== attacker).map((c) => this.space.position(c.id));
+    return this.space.cover(this.space.position(attacker), this.space.position(target), others);
+  }
+
+  /**
+   * Is `attacker` flanking `target` with an ally? The two must be on opposite
+   * sides of it, both able to act and attack in melee, and both have it in
+   * reach. https://2e.aonprd.com/Rules.aspx?ID=2375
+   */
+  flanking(attacker: string, target: string): boolean {
+    const threatens = (id: string) => {
+      const c = this.creature(id);
+      const melee = this.meleeStrike(c);
+      return !!melee && this.canAct(id) && !this.has(id, "restrained") && this.inReach(id, target, this.reachWith(c, melee.profile));
+    };
+    if (!threatens(attacker)) return false;
+    const [a, t] = [this.space.position(attacker), this.space.position(target)];
+    const side = this.creature(attacker).side;
+    return this.all().some((ally) => ally.id !== attacker && ally.side === side && threatens(ally.id) && onOppositeSides(a, this.space.position(ally.id), t));
+  }
+
+  /** What the two creatures' positions do to the target's AC, for the log. */
+  private positionNotes(attacker: string, target: string, melee: boolean): string[] {
+    const cover = this.coverAgainst(target, attacker);
+    return [...(melee && this.flanking(attacker, target) ? ["flanked"] : []), ...(cover !== "none" ? [`${cover} cover`] : [])];
+  }
+
+  /** How standing creatures look to `mover`: allies can be walked past, enemies block. */
+  private occupancyFor(mover: Creature) {
+    return (pos: Position) => {
+      const others = this.standingAt(pos).filter((c) => c.id !== mover.id);
+      if (others.some((c) => c.side !== mover.side)) return "block" as const;
+      return others.length ? ("pass" as const) : ("free" as const);
+    };
+  }
+
+  /**
+   * The squares a Stride to `to` would enter, with feet spent so far: the
+   * cheapest route within the creature's Speed, or [] if there is none.
+   * https://2e.aonprd.com/Rules.aspx?ID=2356
+   */
+  stridePath(id: string, to: Place): ReturnType<typeof findPath> {
+    const actor = this.creature(id);
+    return findPath(this.space.map, this.space.position(id), toPosition(to), { within: actor.speed, occupancy: this.occupancyFor(actor) });
+  }
+
+  /**
+   * A Stride that heads for the nearest square `goal` accepts, going as far
+   * along the cheapest route as Speed allows. Null if no such square can be
+   * reached at all, or the creature is already on one.
+   */
+  strideToward(id: string, toward: Position, goal: (pos: Position) => boolean): Extract<SingleCommand, { action: "stride" }> | null {
+    const actor = this.creature(id);
+    const path = findPath(this.space.map, this.space.position(id), toward, { goal, maxFeet: actor.speed, occupancy: this.occupancyFor(actor) });
+    const end = path.at(-1);
+    return end ? { action: "stride", to: { x: end.x, y: end.y }, path: path.map(({ x, y }) => ({ x, y })) } : null;
+  }
+
+  /** Feet a listed route costs, or a reason it can't be walked. */
+  private routeCost(actor: Creature, route: readonly Position[]): number | string {
+    const occupancy = this.occupancyFor(actor);
+    let at = this.space.position(actor.id);
+    let feet = 0;
+    let odd = false;
+    for (const next of route) {
+      const [dx, dy] = [Math.abs(next.x - at.x), Math.abs(next.y - at.y)];
+      if (Math.max(dx, dy) !== 1) return "each square on the path must be next to the one before";
+      const extra = entryCost(this.space.terrain(next));
+      if (extra === undefined) return "the path crosses a square that can't be entered";
+      if (occupancy(next) === "block") return "an enemy blocks the path (Tumble Through isn't implemented)";
+      const diagonal = dx === 1 && dy === 1;
+      feet += (diagonal && odd ? 10 : 5) + extra;
+      if (diagonal) odd = !odd;
+      at = next;
+    }
+    return feet;
   }
 
   /**
@@ -476,7 +581,12 @@ export class Encounter {
 
   /** Creatures in an area. An emanation's creator is in it only if the spell includes it. */
   creaturesIn(area: Area, caster: Creature, includeCaster: boolean): Creature[] {
-    return this.all().filter((c) => !c.dead && (c.id === caster.id ? includeCaster && area.kind === "emanation" : spaceInArea(area, this.spaceOf(c.id))));
+    // Creatures need line of effect to the area's point of origin. https://2e.aonprd.com/Rules.aspx?ID=2382
+    const reached = (c: Creature) =>
+      area.kind === "burst" ? this.space.lineOfEffectFromPoint(area.corner, this.space.position(c.id)) : this.lineOfEffect(caster.id, c.id);
+    return this.all().filter(
+      (c) => !c.dead && (c.id === caster.id ? includeCaster && area.kind === "emanation" : spaceInArea(area, this.spaceOf(c.id)) && reached(c)),
+    );
   }
 
   /** Spell DC: 10 + spell attack modifier parts + DC modifiers (stupefied, frightened...). */
@@ -522,11 +632,17 @@ export class Encounter {
     return 10 + stackModifiers([...c.saves[save], ...this.situational(id, save, { kind: "save", save, dc: true }, other)]).total;
   }
 
-  /** AC against `attacker`: off-guard to it if the attacker is hidden from the target. */
-  armorClass(targetId: string, attackerId: string): number {
+  /**
+   * AC against `attacker`: off-guard to it if the attacker is hidden from the
+   * target or, for a melee attack, flanking it; higher behind cover.
+   */
+  armorClass(targetId: string, attackerId: string, melee = false): number {
     const target = this.creature(targetId);
     const mods = [...target.ac, ...this.situational(targetId, "ac", { kind: "ac" }, attackerId)];
     if (this.hiddenFrom(attackerId, targetId)) mods.push({ label: "off-guard (attacker hidden)", type: "circumstance", value: -2 });
+    if (melee && this.flanking(attackerId, targetId)) mods.push({ label: "off-guard (flanked)", type: "circumstance", value: -2 });
+    const cover = this.coverAgainst(targetId, attackerId);
+    if (cover !== "none") mods.push({ label: `${cover} cover`, type: "circumstance", value: cover === "standard" ? 2 : 1 });
     return 10 + stackModifiers(mods).total;
   }
 
@@ -567,7 +683,7 @@ export class Encounter {
       if (!away && command.action !== "stand") return `fleeing: must spend actions getting away from ${fleeing.source}`;
       if (away) {
         const source = this.space.position(fleeing.source);
-        if (Math.abs(command.to - source) <= Math.abs(this.space.position(actorId) - source)) return "fleeing: must move away from the source";
+        if (this.space.feet(toPosition(command.to), source) <= this.space.feet(this.space.position(actorId), source)) return "fleeing: must move away from the source";
       }
     }
     // https://2e.aonprd.com/Conditions.aspx?ID=90
@@ -582,31 +698,45 @@ export class Encounter {
         if (command.target === "trigger") return asReaction ? null : "only a readied Strike can target the trigger";
         const target = this.validTarget(actorId, command.target);
         if (typeof target === "string") return target;
-        const distance = this.space.distance(actorId, target.id);
+        if (!this.lineOfEffect(actorId, target.id)) return "no line of effect to the target";
         if (profile.range === "melee") {
-          return distance <= this.reachWith(actor, profile) ? null : "target out of reach";
+          return this.inReach(actorId, target.id, this.reachWith(actor, profile)) ? null : "target out of reach";
         }
         if (!profile.rangeIncrement) return "ranged strike has no range increment";
-        return rangePenalty(distance, profile.rangeIncrement) === null ? "target out of range" : null;
+        return rangePenalty(this.space.distance(actorId, target.id), profile.rangeIncrement) === null ? "target out of range" : null;
       }
       case "stride": {
-        const from = this.space.position(actorId);
-        const distance = Math.abs(command.to - from);
-        if (command.to % SQUARE !== 0 || distance === 0) return "invalid destination";
-        if (distance > actor.speed) return `destination is ${distance} feet away; Speed is ${actor.speed}`;
-        for (const square of LineSpace.path(from, command.to)) {
-          const blockers = this.standingAt(square).filter((c) => c.side !== actor.side);
-          if (blockers.length) return "an enemy blocks the path (Tumble Through isn't implemented)";
+        const to = toPosition(command.to);
+        if (samePosition(to, this.space.position(actorId))) return "invalid destination";
+        if (!this.space.passable(to)) return "destination can't be entered";
+        if (this.standingAt(to).length) return "destination is occupied";
+        if (command.path) {
+          const route = command.path.map(toPosition);
+          if (!route.length || !samePosition(route.at(-1)!, to)) return "the path must end at the destination";
+          const feet = this.routeCost(actor, route);
+          if (typeof feet === "string") return feet;
+          return feet > actor.speed ? `that path is ${feet} feet; Speed is ${actor.speed}` : null;
         }
-        return this.standingAt(command.to).length ? "destination is occupied" : null;
+        if (this.stridePath(actorId, to).length) return null;
+        // Say why: too far, or walled off or blocked by enemies.
+        const open = findPath(this.space.map, this.space.position(actorId), to, { within: 4 * actor.speed, occupancy: this.occupancyFor(actor) });
+        return open.length
+          ? `destination is ${open.at(-1)!.feet} feet away; Speed is ${actor.speed}`
+          : "no path there within reach of a Stride (an enemy or a wall blocks the way; Tumble Through isn't implemented)";
       }
       case "step":
       case "crawl": {
         // https://2e.aonprd.com/Actions.aspx?ID=2304, https://2e.aonprd.com/Actions.aspx?ID=2293
         if (actor.speed < 10) return `${command.action === "step" ? "Step" : "Crawl"} requires a Speed of at least 10 feet`;
         if (command.action === "crawl" && !prone) return "Crawl requires being prone";
-        if (Math.abs(command.to - this.space.position(actorId)) !== SQUARE) return "moves exactly 5 feet";
-        return this.standingAt(command.to).length ? "destination is occupied" : null;
+        const to = toPosition(command.to);
+        const from = this.space.position(actorId);
+        if (Math.max(Math.abs(to.x - from.x), Math.abs(to.y - from.y)) !== 1) return "moves exactly 5 feet";
+        const extra = entryCost(this.space.terrain(to));
+        if (extra === undefined) return "destination can't be entered";
+        // "You can't Step into difficult terrain"; a 5-foot Crawl can't pay for it either.
+        if (extra > 0) return `can't ${command.action === "step" ? "Step" : "Crawl"} into difficult terrain`;
+        return this.standingAt(to).length ? "destination is occupied" : null;
       }
       case "stand":
         return prone ? null : "not prone";
@@ -636,7 +766,7 @@ export class Encounter {
         // Size limits (no more than one size larger) aren't checked yet.
         const target = this.validTarget(actorId, command.target);
         if (typeof target === "string") return target;
-        if (this.space.distance(actorId, target.id) > actor.reach) return "target out of reach";
+        if (!this.inReach(actorId, target.id, actor.reach) || !this.lineOfEffect(actorId, target.id)) return "target out of reach";
         const holding = command.action === "grapple" && this.grappleEffects(actorId, target.id).length > 0;
         return actor.freeHands > 0 || holding ? null : "needs a free hand";
       }
@@ -691,7 +821,8 @@ export class Encounter {
       const target = this.creatures.get(id);
       if (!target || target.dead) return `invalid target ${id}`;
       const distance = this.space.distance(caster.id, id);
-      if (range === "touch" ? distance > caster.reach : range !== null && distance > range) return `${target.name} is out of range`;
+      if (range === "touch" ? !this.inReach(caster.id, id, caster.reach) : range !== null && distance > range) return `${target.name} is out of range`;
+      if (id !== caster.id && !this.lineOfEffect(caster.id, id)) return `no line of effect to ${target.name}`;
       if (def.needsSight && this.hiddenFrom(id, caster.id)) return `can't see ${target.name}`;
       if (def.targetKind === "willing-living-or-undead" && !target.traits.includes("undead")) {
         if (target.side !== caster.side) return `${target.name} isn't willing`;
@@ -704,7 +835,7 @@ export class Encounter {
     }
     if (command.options?.melee) {
       const t = targets[0];
-      if (!t || this.space.distance(caster.id, t) > caster.reach) return "melee spell attack needs a target within reach";
+      if (!t || !this.inReach(caster.id, t, caster.reach)) return "melee spell attack needs a target within reach";
     }
     return null;
   }
@@ -977,7 +1108,7 @@ export class Encounter {
       case "stride":
       case "step":
       case "crawl":
-        return this.move(actor, command.to, command.action);
+        return this.move(actor, command, command.action);
       case "stand":
         return this.removeCondition(actor, "prone");
       case "drop-prone":
@@ -1049,11 +1180,14 @@ export class Encounter {
   }
 
   /** Move square by square so reactions can respond to each square left or entered. */
-  private move(actor: Creature, to: number, kind: "stride" | "step" | "crawl"): void {
+  private move(actor: Creature, command: { to: Place; path?: readonly Place[] }, kind: "stride" | "step" | "crawl"): void {
     // A Grapple holds only "unless you move".
     for (const e of this.effects.filter((e) => e.source === actor.id && e.tags.includes(GRAPPLE_TAG))) this.endEffect(e, "removed");
     const triggers = kind !== "step";
-    for (const square of LineSpace.path(this.space.position(actor.id), to)) {
+    const to = toPosition(command.to);
+    const route: Position[] = command.path ? command.path.map(toPosition) : kind === "stride" ? this.stridePath(actor.id, to) : [to];
+    for (const step of route) {
+      const square = { x: step.x, y: step.y };
       const from = this.space.position(actor.id);
       if (triggers) {
         this.offerReactions({ kind: "leave-square", actor: actor.id, from, to: square });
@@ -1092,11 +1226,11 @@ export class Encounter {
     return effect !== undefined;
   }
 
-  private rollAttack(attacker: Creature, target: Creature, modifiers: Modifier[], options: { adjusters?: DegreeAdjuster[] } = {}): CheckResult | null {
+  private rollAttack(attacker: Creature, target: Creature, modifiers: Modifier[], options: { adjusters?: DegreeAdjuster[]; melee?: boolean } = {}): CheckResult | null {
     const sure = this.takeSureStrike(attacker);
     if (!sure && !this.targetingCheck(attacker, target)) return null;
     const mods = sure ? modifiers.filter((m) => !(m.type === "circumstance" && m.value < 0)) : modifiers;
-    return rollCheck(this.rng, mods, this.armorClass(target.id, attacker.id), { fortune: sure, ...(options.adjusters ? { adjusters: options.adjusters } : {}) });
+    return rollCheck(this.rng, mods, this.armorClass(target.id, attacker.id, options.melee ?? false), { fortune: sure, ...(options.adjusters ? { adjusters: options.adjusters } : {}) });
   }
 
   private resolveStrike(attacker: Creature, target: Creature, profile: StrikeProfile, map: number, reaction: boolean): StrikeResult | null {
@@ -1109,10 +1243,18 @@ export class Encounter {
       const penalty = rangePenalty(this.space.distance(attacker.id, target.id), profile.rangeIncrement) ?? 0;
       if (penalty !== 0) modifiers.push({ label: "range penalty", type: "untyped", value: penalty });
     }
-    const check = this.rollAttack(attacker, target, modifiers);
+    const check = this.rollAttack(attacker, target, modifiers, { melee: profile.range === "melee" });
     if (!check) return null;
     const base = { attacker: attacker.id, target: target.id, weapon: profile.name, map, check };
-    this.emit({ kind: "attack-roll", attacker: attacker.id, target: target.id, weapon: profile.name, check, reaction });
+    this.emit({
+      kind: "attack-roll",
+      attacker: attacker.id,
+      target: target.id,
+      weapon: profile.name,
+      check,
+      reaction,
+      position: this.positionNotes(attacker.id, target.id, profile.range === "melee"),
+    });
 
     if (!succeeded(check.degree)) {
       const result: StrikeResult = { ...base, damage: null, defended: null, hp: null };
@@ -1288,9 +1430,18 @@ export class Encounter {
         // https://2e.aonprd.com/Rules.aspx?ID=2292 (Spell Attack Rolls)
         const mods: Modifier[] = [...sc.attack, ...this.situational(caster.id, "attack", { kind: "attack", attribute: sc.attribute, range }, target.id)];
         if (map !== 0) mods.push({ label: "multiple attack penalty", type: "untyped", value: map });
-        const check = this.rollAttack(caster, target, mods, tooStrong(target) ? { adjusters: [() => -1] } : {});
+        const melee = range === "melee";
+        const check = this.rollAttack(caster, target, mods, { melee, ...(tooStrong(target) ? { adjusters: [() => -1] } : {}) });
         if (!check) return null;
-        this.emit({ kind: "attack-roll", attacker: caster.id, target: target.id, weapon: def.name, check, reaction: false });
+        this.emit({
+          kind: "attack-roll",
+          attacker: caster.id,
+          target: target.id,
+          weapon: def.name,
+          check,
+          reaction: false,
+          position: this.positionNotes(caster.id, target.id, melee),
+        });
         return check.degree;
       },
       save: (target, save) => {
@@ -1574,9 +1725,10 @@ export class Encounter {
         const t = trigger.traits;
         qualifies =
           (t.includes("manipulate") || t.includes("move") || (t.includes("attack") && trigger.ranged)) &&
-          this.space.distance(reactor.id, trigger.actor) <= reach;
+          this.inReach(reactor.id, trigger.actor, reach) &&
+          this.lineOfEffect(reactor.id, trigger.actor);
       } else if (trigger.kind === "leave-square") {
-        qualifies = Math.abs(this.space.position(reactor.id) - trigger.from) <= reach;
+        qualifies = this.inReach(reactor.id, trigger.from, reach) && this.space.lineOfEffect(this.space.position(reactor.id), trigger.from);
       }
       if (qualifies) {
         choices.push({
@@ -1670,7 +1822,7 @@ export class Encounter {
       if (trigger.kind !== "enter-square") return false;
       const melee = this.meleeStrike(reactor);
       const reach = melee ? this.reachWith(reactor, melee.profile) : reactor.reach;
-      return Math.abs(this.space.position(reactor.id) - trigger.at) <= reach;
+      return this.inReach(reactor.id, trigger.at, reach);
     }
     if (trigger.kind !== "action") return false;
     return ready.trait ? trigger.traits.includes(ready.trait) : true;
@@ -1723,7 +1875,7 @@ export class Encounter {
     if (effect.conditions.length && this.creatures.has(effect.target)) this.refreshDown(this.creature(effect.target));
   }
 
-  private standingAt(square: number): Creature[] {
+  private standingAt(square: Place): Creature[] {
     return this.space.occupants(square).map((id) => this.creature(id)).filter((c) => !c.down);
   }
 

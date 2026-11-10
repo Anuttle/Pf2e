@@ -3,7 +3,8 @@
 import { aiController } from "./ai.ts";
 import type { Creature } from "./creature.ts";
 import { Encounter, type EncounterEvent, type EncounterResult } from "./encounter.ts";
-import { SQUARE } from "./space.ts";
+import type { BattleMap } from "./grid.ts";
+import { type Place, SQUARE } from "./space.ts";
 
 export { rollInitiative } from "./encounter.ts";
 export type BattleEvent = EncounterEvent;
@@ -11,8 +12,13 @@ export type BattleResult = EncounterResult;
 
 export interface BattleOptions {
   maxRounds?: number;
-  /** Starting positions in feet. By default the party lines up behind 0 and enemies from 30 feet. */
-  positions?: Record<string, number>;
+  /** A battle map to fight on. Its tokens give the starting squares unless `positions` does. */
+  map?: BattleMap;
+  /**
+   * Starting squares ({x, y}, or feet along one row). Without a map the party
+   * lines up behind 0 and enemies from 30 feet, on open floor.
+   */
+  positions?: Record<string, Place>;
 }
 
 export function defaultPositions(creatures: readonly Creature[]): Record<string, number> {
@@ -35,7 +41,8 @@ export function runBattle(seed: number, creatures: Creature[], options: BattleOp
   return new Encounter({
     seed,
     creatures,
-    positions: options.positions ?? defaultPositions(creatures),
+    ...(options.map ? { map: options.map } : {}),
+    ...(options.positions || !options.map ? { positions: options.positions ?? defaultPositions(creatures) } : {}),
     controllers: () => aiController,
     ...(options.maxRounds ? { maxRounds: options.maxRounds } : {}),
   }).run();

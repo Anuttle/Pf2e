@@ -60,9 +60,9 @@ export function goblinWarrior(id = "goblin-warrior", name = "Goblin Warrior"): C
 /**
  * A ruined courtyard for trying out the grid and views: a broken wall with a
  * doorway, a raised 10-foot platform reached by a 5-foot step, rubble, and a
- * pool. Valeros starts south of the wall, goblins north of it.
+ * pool. The party (Valeros by default) starts south of the wall, goblins north of it.
  */
-export function goblinCourtyard(goblins = 3): { map: BattleMap; creatures: Creature[] } {
+export function goblinCourtyard(goblins = 3, party: Creature[] = [valeros()]): { map: BattleMap; creatures: Creature[] } {
   const map = parseMap(
     [
       "............",
@@ -87,14 +87,13 @@ export function goblinCourtyard(goblins = 3): { map: BattleMap; creatures: Creat
       ],
     },
   );
-  const creatures = [
-    valeros(),
-    ...Array.from({ length: goblins }, (_, i) => goblinWarrior(`goblin-${i + 1}`, `Goblin Warrior ${i + 1}`)),
-  ];
-  placeToken(map, "valeros", { x: 6, y: 5 });
-  const starts = [{ x: 5, y: 1 }, { x: 7, y: 2 }, { x: 3, y: 2 }, { x: 10, y: 1 }, { x: 1, y: 0 }];
-  creatures.slice(1).forEach((c, i) => placeToken(map, c.id, starts[i % starts.length]!));
-  return { map, creatures };
+  const enemies = Array.from({ length: goblins }, (_, i) => goblinWarrior(`goblin-${i + 1}`, `Goblin Warrior ${i + 1}`));
+  const partyStarts = [{ x: 6, y: 5 }, { x: 5, y: 6 }, { x: 7, y: 6 }, { x: 6, y: 7 }, { x: 4, y: 7 }, { x: 8, y: 7 }];
+  const enemyStarts = [{ x: 5, y: 1 }, { x: 7, y: 2 }, { x: 3, y: 2 }, { x: 10, y: 1 }, { x: 1, y: 0 }, { x: 6, y: 0 }, { x: 9, y: 0 }, { x: 0, y: 2 }];
+  if (party.length > partyStarts.length || goblins > enemyStarts.length) throw new Error("the courtyard has no room for that many creatures");
+  party.forEach((c, i) => placeToken(map, c.id, partyStarts[i]!));
+  enemies.forEach((c, i) => placeToken(map, c.id, enemyStarts[i]!));
+  return { map, creatures: [...party, ...enemies] };
 }
 
 /**

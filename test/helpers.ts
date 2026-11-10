@@ -1,6 +1,8 @@
 import { type Creature, buildMonster } from "../src/creature.ts";
 import type { Rng } from "../src/dice.ts";
 import { type Command, type Controller, Encounter, type EncounterEvent, type ReactionOption, type Trigger } from "../src/encounter.ts";
+import type { BattleMap } from "../src/grid.ts";
+import type { Place } from "../src/space.ts";
 
 /**
  * An Rng that makes rollDie return the given faces in order. Each entry is
@@ -58,9 +60,9 @@ export function scripted(
 
 export function encounter(
   creatures: Creature[],
-  positions: Record<string, number>,
+  positions: Record<string, Place>,
   controllers: Record<string, Controller>,
-  extra: { rng?: Rng; maxRounds?: number } = {},
+  extra: { rng?: Rng; maxRounds?: number; map?: BattleMap } = {},
 ): Encounter {
   return new Encounter({
     seed: 0,
@@ -70,6 +72,7 @@ export function encounter(
     initiative: creatures.map((c) => c.id),
     maxRounds: extra.maxRounds ?? 1,
     ...(extra.rng ? { rng: extra.rng } : {}),
+    ...(extra.map ? { map: extra.map } : {}),
   });
 }
 

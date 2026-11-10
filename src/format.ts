@@ -13,7 +13,8 @@ export function formatBattle(result: EncounterResult, creatures: readonly Creatu
   return [`Seed ${result.seed}`, ...result.events.flatMap((e) => formatEvent(e, name))];
 }
 
-function formatEvent(event: EncounterEvent, name: (id: string) => string): string[] {
+/** The log lines for one event (none for events the log leaves out). */
+export function formatEvent(event: EncounterEvent, name: (id: string) => string): string[] {
   switch (event.kind) {
     case "initiative":
       return [
@@ -45,7 +46,7 @@ function formatEvent(event: EncounterEvent, name: (id: string) => string): strin
       const c = event.check;
       const mods = c.modifiers.map((m) => `${m.label} ${formatModifier(m.value)}${m.enabled ? "" : " (suppressed)"}`).join(", ");
       return [
-        `    ${name(event.attacker)} Strikes with ${event.weapon} vs ${name(event.target)}${event.reaction ? " (reaction)" : ""}: d20 ${c.die} ${formatModifier(c.modifier)} = ${c.total} vs AC ${c.dc} -> ${DEGREE_NAMES[c.degree]}`,
+        `    ${name(event.attacker)} Strikes with ${event.weapon} vs ${name(event.target)}${event.reaction ? " (reaction)" : ""}: d20 ${c.die} ${formatModifier(c.modifier)} = ${c.total} vs AC ${c.dc}${event.position.length ? ` (${event.position.join(", ")})` : ""} -> ${DEGREE_NAMES[c.degree]}`,
         `      modifiers: ${mods}`,
       ];
     }
@@ -138,9 +139,9 @@ function describeCommand(c: SingleCommand, name: (id: string) => string): string
     case "strike":
       return `a Strike against ${c.target === "trigger" ? "the triggering creature" : name(c.target)}`;
     case "stride":
-      return `a Stride to ${c.to} ft`;
+      return `a Stride to ${describePlace(c.to)}`;
     case "step":
-      return `a Step to ${c.to} ft`;
+      return `a Step to ${describePlace(c.to)}`;
     case "raise-shield":
       return "Raise a Shield";
     case "interact":
@@ -148,7 +149,7 @@ function describeCommand(c: SingleCommand, name: (id: string) => string): string
     case "sustain":
       return "Sustain";
     case "crawl":
-      return `a Crawl to ${c.to} ft`;
+      return `a Crawl to ${describePlace(c.to)}`;
     case "stand":
       return "Stand";
     case "drop-prone":
@@ -166,4 +167,9 @@ function describeCommand(c: SingleCommand, name: (id: string) => string): string
 
 function describeTrigger(t: ReadyTrigger): string {
   return t.kind === "enemy-enters-reach" ? "when an enemy enters reach" : `when an enemy uses ${t.trait ? `a ${t.trait}` : "an"} action`;
+}
+
+/** A destination as it was given: feet along the row, or a square's coordinates. */
+function describePlace(place: number | { x: number; y: number }): string {
+  return typeof place === "number" ? `${place} ft` : `square ${place.x},${place.y}`;
 }

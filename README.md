@@ -4,7 +4,7 @@ A headless, deterministic rules engine for Pathfinder Second Edition (Remaster) 
 
 ## Status
 
-Milestones 1–4 of the design doc are in:
+Milestones 1–6 of the design doc are in:
 
 - **Dice and checks**: seeded dice, modifier stacking, proficiency, the four degrees of success, natural 1/20, degree adjusters, flat checks.
 - **Strike loop**: character and monster statistics, AC, multiple attack penalty (agile), range increments, damage rolls (minimum 1, crit doubling, deadly, fatal, striking runes), immunity / weakness / resistance, temporary HP, massive damage.
@@ -12,16 +12,17 @@ Milestones 1–4 of the design doc are in:
 - **Conditions and dying**: off-guard, frightened, sickened, clumsy, enfeebled, stupefied, drained, doomed, wounded, prone, grabbed, restrained, immobilized, concealed, hidden, blinded, dazzled, unconscious, slowed, stunned, quickened and persistent damage, with implied conditions and overrides; Grapple, Trip, Escape, Stand, Crawl and Drop Prone; knocked out at 0 HP (initiative moves, dying 1 or 2 plus wounded), recovery checks, death at dying 4 minus doomed, massive damage, Hero Points to stabilize, healing, nonlethal knockouts, and monsters that die at 0 HP.
 - **Spells (milestone 6)**: Cast a Spell with prepared slots and cantrips (heightened to half level), spell attack and spell DC, basic and non-basic saves, incapacitation, fortune, stupefied's casting flat check, disruption that still spends the slot, and temporary spell immunity. Spells: ignition, telekinetic projectile, electric arc, daze, shield (with its Shield Block), force barrage, fear (with fleeing), heal (1, 2 and 3 actions), enfeeble, sure strike, runic weapon, and the area spells breathe fire (cone), sleep and fireball (bursts), lightning bolt (line) and bless (an aura you can Sustain to widen).
 - **Areas**: bursts from a grid corner, cones, emanations and lines, measured like movement (diagonals 5 then 10 feet), in `src/areas.ts` as pure geometry on x/y squares. Area spells roll damage once and each creature in the area saves. Sample casters: Ezren (wizard) and Kyra (cleric); the AI heals fallen allies and uses attack cantrips.
-- **Grid and isometric view (started)**: a map of 5-foot squares with terrain and elevation, token placement, walking paths with Pathfinder movement costs (alternating diagonals, difficult and greater difficult terrain), and an animated isometric ASCII view drawn from the player's point of view (centered on their creature, view radius, four camera rotations, walls cut away when they would hide a creature). Not yet connected to the encounter engine, which still uses positions on a line.
+- **Grid (milestone 5)**: encounters are fought on a map of 5-foot squares with terrain and elevation (`src/grid.ts`), or on open floor when no map is given. Strides take the cheapest route with Pathfinder movement costs (every second diagonal 10 feet, difficult terrain +5, greater difficult +10), around walls and water, past allies but not enemies; you can't Step into difficult terrain. Reach is measured on the grid (10-foot reach covers 2 squares diagonally). Flanking makes a foe off-guard to melee attacks. Cover gives +2 AC behind a wall and +1 behind another creature. Line of effect: no targeting, reactions or area effects through solid walls. The AI paths around obstacles to reach its targets.
+- **Isometric view**: an animated ASCII view of the map for a player (`src/iso.ts`), and `npm run fight` to watch a whole encounter play out on it.
 
-Next up: the rest of milestone 5: wire the grid into the encounter engine (movement costs, flanking, cover, real reach and areas).
+Next up: larger creatures on the grid, cover on Reflex saves against areas, and smarter AI positioning (seeking flanks, avoiding Reactive Strikes).
 
 ### Stand-ins until later milestones
 
-- **Positions are on a line**, in 5-foot squares, until the grid arrives in milestone 5. Reach, range, movement and every reaction trigger already work on it.
+- **One square each.** Every creature occupies a single square; Large and bigger spaces aren't on the grid yet. Elevation is drawn but doesn't affect reach, cover or movement cost, and walls are the only terrain that blocks line of effect.
 - **Controllers are synchronous.** The engine calls a creature's controller for each action and each reaction offer (`src/encounter.ts`, `Controller`). The design doc's prompt-and-respond API for UIs can wrap this later.
 - **No reactions before a creature's first turn.** The rules leave that to the GM.
-- **Areas on the line**: until the grid is wired in, the engine puts every creature on row 0 (x = feet / 5), so a burst or cone only catches creatures on that row. Line of effect and cover against areas need the grid's walls, and lines only run in the eight compass directions. Orthogonal cones are a 90° quarter circle from the caster's edge (centers within 45° of straight ahead, within the length measured like movement).
+- **Areas**: cover's +2 to Reflex saves against area effects isn't applied yet, and lines only run in the eight compass directions.
 - **Spells not yet**: spontaneous casters and focus spells, and the AI spending slots on offensive or area spells.
 - **Not yet**: size limits on Grapple and Trip, the free 5-foot Stride on a critical Escape, quickened's limits on its extra action, Retching and assisted recovery from persistent damage, and spells (stupefied's casting check waits for them).
 
@@ -37,9 +38,12 @@ npm run duel -- 42 3   # seed 42: Valeros (level 1 fighter) vs 3 goblin warriors
 npm run duel -- 42 5 valeros,ezren,kyra   # the whole party vs 5 goblins
 npm run view -- 0 4    # isometric view of the sample courtyard: rotation 0-3, radius 4 (omit for the whole map)
 npm run view -- --demo # watch it play by itself: Valeros walks, the goblins close in
+npm run fight -- 7 3 valeros,kyra   # watch a fight on the courtyard map: seed, goblins, party
 ```
 
-In a terminal, `npm run view` is interactive and animated: creatures walk square to square as stick figures with a stepping leg cycle. `w`/`a`/`s`/`d` step Valeros along the grid (`w` is up-right on screen), `space` gives the goblins their turn (each walks up to its Speed toward Valeros, around walls and water, paying Pathfinder movement costs), `q`/`e` rotate the camera, `+`/`-` change the view radius, `x` quits. This previews the grid; it is not wired into the encounter engine yet, so nobody attacks.
+In a terminal, `npm run view` is interactive and animated: creatures walk square to square as stick figures with a stepping leg cycle. `w`/`a`/`s`/`d` step Valeros along the grid (`w` is up-right on screen), `space` gives the goblins their turn (each walks up to its Speed toward Valeros, around walls and water, paying Pathfinder movement costs), `q`/`e` rotate the camera, `+`/`-` change the view radius, `x` quits. It is a movement sandbox; nobody attacks.
+
+`npm run fight` runs a real AI-vs-AI encounter on the same map and replays it in the view: creatures walk, Strike, cast and fall while the log scrolls underneath. `space` pauses, `q`/`e` rotate, `+`/`-` change the speed, `x` quits. Piped to a file it prints the full log and the final map. `npm run duel` is the same engine on open floor, as text only.
 
 ### Reading the isometric view
 
@@ -81,12 +85,13 @@ _.·'    _  / \  _   g   |   |
 | `src/shields.ts` | Shields, Hardness, Shield Block |
 | `src/spells.ts` | Spell definitions and the spell host interface |
 | `src/areas.ts` | Area geometry: bursts, cones, emanations, lines |
-| `src/space.ts` | Positions on a line (stand-in for the grid) |
+| `src/space.ts` | Positions in an encounter; reach, line of effect, cover, flanking |
 | `src/ai.ts` | Default AI controller |
 | `src/battle.ts` | AI-vs-AI fights for the CLI and tests |
 | `src/format.ts` | Human-readable battle log |
-| `src/grid.ts` | Battle map: squares, terrain, elevation, tokens |
+| `src/grid.ts` | Battle map: squares, terrain, elevation, tokens, walking paths |
 | `src/iso.ts` | Isometric ASCII view for a player |
 | `src/content.ts` | Sample creatures |
 | `cli/duel.ts` | Command-line fight |
-| `cli/view.ts` | Isometric view of the sample map |
+| `cli/view.ts` | Isometric movement sandbox on the sample map |
+| `cli/fight.ts` | Animated replay of a fight on the sample map |

@@ -16,7 +16,8 @@ describe("turn structure", () => {
       chooseAction(enc, id) {
         const turn = enc.turn!;
         if (turn.actions === 0) return { action: "end-turn" };
-        return { action: "step", to: enc.space.position(id) - 5 };
+        const here = enc.space.position(id);
+        return { action: "step", to: { x: here.x - 1, y: here.y } };
       },
       chooseReaction: () => null,
     };
@@ -24,7 +25,7 @@ describe("turn structure", () => {
     enc.run();
     const steps = enc.events.filter((e) => e.kind === "action" && e.action === "Step");
     assert.equal(steps.length, 3);
-    assert.equal(enc.space.position("valeros"), -15);
+    assert.deepEqual(enc.space.position("valeros"), { x: -3, y: 0 });
   });
 
   it("explains why an action is illegal", () => {
@@ -35,6 +36,8 @@ describe("turn structure", () => {
         chooseAction(e, id) {
           reasons.push(
             e.illegal(id, { action: "stride", to: 30 }),
+            // Straight through the goblin's square is blocked; around it is 25 feet and fine.
+            e.illegal(id, { action: "stride", to: 20, path: [5, 10, 15, 20] }),
             e.illegal(id, { action: "stride", to: 20 }),
             e.illegal(id, { action: "strike", target: "ogre" }),
             e.illegal(id, { action: "ready", readied: { action: "stride", to: 5 }, trigger: { kind: "enemy-enters-reach" } }),
@@ -50,9 +53,10 @@ describe("turn structure", () => {
     enc.run();
     assert.match(reasons[0]!, /Speed is 25/);
     assert.match(reasons[1]!, /enemy blocks the path/);
-    assert.match(reasons[2]!, /out of reach/);
-    assert.equal(reasons[3], null);
+    assert.equal(reasons[2], null);
+    assert.match(reasons[3]!, /out of reach/);
     assert.equal(reasons[4], null);
+    assert.equal(reasons[5], null);
   });
 });
 
@@ -69,7 +73,7 @@ describe("Reactive Strike", () => {
     );
     const result = enc.run();
     assert.equal(kinds(enc.events, "reaction").length, 1);
-    assert.equal(enc.space.position("g"), 5, "the goblin dropped before leaving its square");
+    assert.deepEqual(enc.space.position("g"), { x: 1, y: 0 }, "the goblin dropped before leaving its square");
     assert.equal(result.winner, "party");
   });
 
@@ -82,7 +86,7 @@ describe("Reactive Strike", () => {
     );
     enc.run();
     assert.equal(offered.length, 0);
-    assert.equal(enc.space.position("g"), 10);
+    assert.deepEqual(enc.space.position("g"), { x: 2, y: 0 });
   });
 
   it("triggers on a ranged attack within reach, and takes no multiple attack penalty", () => {
@@ -253,7 +257,7 @@ describe("Delay", () => {
     );
     enc.run();
     assert.equal(offered.length, 0);
-    assert.equal(enc.space.position("g"), 25);
+    assert.deepEqual(enc.space.position("g"), { x: 5, y: 0 });
   });
 });
 
@@ -276,7 +280,7 @@ describe("Ready", () => {
       valerosActions.map((e) => e.kind === "action" && [e.action, e.reaction]),
       [["Ready", false], ["Strike (longsword)", true]],
     );
-    assert.equal(enc.space.position("g"), 5);
+    assert.deepEqual(enc.space.position("g"), { x: 1, y: 0 });
     assert.equal(result.winner, "party", "the goblin never got its Strike");
   });
 

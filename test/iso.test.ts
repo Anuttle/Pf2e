@@ -103,6 +103,18 @@ describe("creatures and the player's view", () => {
     assert.match(at().join("\n"), /\/ \\/);
   });
 
+  it("draws a standing creature over a fallen one in the same square", () => {
+    const map = parseMap(["."]);
+    const g = goblinWarrior("g");
+    g.down = true;
+    map.tokens.set("g", { x: 0, y: 0 });
+    map.tokens.set("valeros", { x: 0, y: 0 });
+    const view = renderIsometric(map, [valeros(), g], plain);
+    const text = view.lines.join("\n");
+    assert.match(text, /V\n.*\/\|\\/, "the standing figure is whole");
+    assert.equal(view.legend.length, 2, "both are listed");
+  });
+
   it("colours figures and terrain only when asked", () => {
     const map = parseMap([".~"]);
     placeToken(map, "valeros", { x: 0, y: 0 });

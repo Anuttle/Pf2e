@@ -7,7 +7,8 @@
 // offensive spells; scripts and players can.
 
 import type { Command, Controller, Encounter } from "./encounter.ts";
-import { SQUARE } from "./space.ts";
+import type { Position } from "./grid.ts";
+import { withinReach } from "./space.ts";
 
 function nearestFoe(encounter: Encounter, id: string) {
   return encounter
@@ -16,32 +17,37 @@ function nearestFoe(encounter: Encounter, id: string) {
     .at(0);
 }
 
-/** The Stride that ends in reach with the least movement, or else gets closest. */
+/** A Stride toward the nearest square that has the target within melee reach, around walls and creatures. */
 function approach(encounter: Encounter, id: string, targetId: string, reach: number): Command | null {
-  const me = encounter.creature(id);
-  const from = encounter.space.position(id);
   const goal = encounter.space.position(targetId);
-  const direction = Math.sign(goal - from);
-  const legal: number[] = [];
-  for (let d = SQUARE; d <= me.speed; d += SQUARE) {
-    const to = from + direction * d;
-    if (to === goal) break;
-    if (!encounter.illegal(id, { action: "stride", to })) legal.push(to);
-  }
-  const inReach = legal.find((to) => Math.abs(goal - to) <= reach);
-  const closest = [...legal].sort((a, b) => Math.abs(goal - a) - Math.abs(goal - b)).at(0);
-  const to = inReach ?? closest;
-  return to === undefined ? null : { action: "stride", to };
+  return encounter.strideToward(id, goal, (pos) => withinReach(pos, goal, reach) && encounter.space.lineOfEffect(pos, goal));
+}
+
+/** A Stride toward the nearest square within `feet` of the target with a clear line to it. */
+function closeTo(encounter: Encounter, id: string, targetId: string, feet: number): Command | null {
+  const goal = encounter.space.position(targetId);
+  return encounter.strideToward(id, goal, (pos) => encounter.space.feet(pos, goal) <= feet && encounter.space.lineOfEffect(pos, goal));
 }
 
 /** Fleeing: the legal move that ends farthest from the source. */
 function flee(encounter: Encounter, id: string, source: string): Command {
   const from = encounter.space.position(id);
-  const away = Math.sign(from - encounter.space.position(source)) || 1;
-  const me = encounter.creature(id);
-  const moves: Command[] = [];
-  for (let d = me.speed; d >= SQUARE; d -= SQUARE) moves.push({ action: "stride", to: from + away * d });
-  moves.push({ action: "step", to: from + away * SQUARE }, { action: "crawl", to: from + away * SQUARE }, { action: "stand" });
+  const threat = encounter.space.position(source);
+  const squares = encounter.creature(id).speed / 5;
+  const around: Position[] = [];
+  for (let dy = -squares; dy <= squares; dy++) {
+    for (let dx = -squares; dx <= squares; dx++) if (dx || dy) around.push({ x: from.x + dx, y: from.y + dy });
+  }
+  // Farthest from the threat first; ties go to the shorter move, then a fixed order.
+  const away = (p: Position) => encounter.space.feet(p, threat);
+  around.sort((a, b) => away(b) - away(a) || encounter.space.feet(a, from) - encounter.space.feet(b, from) || a.y - b.y || a.x - b.x);
+  const next = around.filter((p) => Math.max(Math.abs(p.x - from.x), Math.abs(p.y - from.y)) === 1);
+  const moves: Command[] = [
+    ...around.map((to): Command => ({ action: "stride", to })),
+    ...next.map((to): Command => ({ action: "step", to })),
+    ...next.map((to): Command => ({ action: "crawl", to })),
+    { action: "stand" },
+  ];
   return firstLegal(encounter, id, moves) ?? { action: "end-turn" };
 }
 
@@ -82,9 +88,9 @@ function casterAction(encounter: Encounter, id: string): Command | null {
 
   // Out of range of everyone: move to within 30 feet of the nearest foe, or toward a fallen ally.
   const fallen = hurt.find((c) => c.down);
-  if (fallen && encounter.space.distance(id, fallen.id) > 30) return approach(encounter, id, fallen.id, 30);
+  if (fallen && (encounter.space.distance(id, fallen.id) > 30 || !encounter.lineOfEffect(id, fallen.id))) return closeTo(encounter, id, fallen.id, 30);
   const knowsAttacks = ATTACK_CANTRIPS.some((s) => me.spellcasting?.cantrips.includes(s));
-  if (knowsAttacks && foes.length && encounter.space.distance(id, foes[0]!.id) > 30) return approach(encounter, id, foes[0]!.id, 30);
+  if (knowsAttacks && foes.length && (encounter.space.distance(id, foes[0]!.id) > 30 || !encounter.lineOfEffect(id, foes[0]!.id))) return closeTo(encounter, id, foes[0]!.id, 30);
   return null;
 }
 
@@ -118,7 +124,7 @@ export const aiController: Controller = {
 
     const melee = encounter.meleeStrike(me);
     const reach = melee ? encounter.reachWith(me, melee.profile) : 0;
-    if (melee && encounter.space.distance(id, target.id) <= reach) {
+    if (melee && encounter.inReach(id, target.id, reach) && encounter.lineOfEffect(id, target.id)) {
       // A third attack at −10 rarely lands; a raised shield helps more.
       if (turn.attacks >= 2 && !encounter.illegal(id, { action: "raise-shield" })) return { action: "raise-shield" };
       const strike: Command = { action: "strike", target: target.id, strike: melee.index };

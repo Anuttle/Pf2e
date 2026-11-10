@@ -9,8 +9,8 @@
 //   q/e       rotate the camera      +/-  view radius      x  quit
 // --demo plays by itself: Valeros walks somewhere new, then the goblins close in.
 //
-// Movement is a preview of the grid, not wired into the encounter engine yet:
-// paths use real costs (diagonals, difficult terrain) but nobody attacks.
+// This is a movement sandbox: paths use real costs (diagonals, difficult
+// terrain) but nobody attacks. For a real fight on the map see cli/fight.ts.
 
 import { goblinCourtyard } from "../src/content.ts";
 import type { Creature } from "../src/creature.ts";

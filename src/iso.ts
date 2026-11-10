@@ -144,7 +144,6 @@ interface Tile {
   rot: Position;
   terrain: Terrain;
   elevation: number;
-  token?: string;
 }
 
 type Pt = readonly [x: number, y: number];
@@ -168,6 +167,8 @@ interface Figure {
   label: string;
   color: Color;
   down: boolean;
+  /** The dead aren't worth cutting a wall away for. */
+  dead: boolean;
   to: Position;
   from?: { rot: Position; elevation: number; progress: number; step: number };
 }
@@ -178,8 +179,6 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
   const focusPos = options.focus ? map.tokens.get(options.focus) : undefined;
   if (options.focus && !focusPos) throw new Error(`focus ${options.focus} has no token on the map`);
 
-  const byPos = new Map<string, string>();
-  for (const [id, p] of map.tokens) byPos.set(`${p.x},${p.y}`, id);
 
   // Visible squares, indexed by rotated position, in painting order: back to front.
   const tiles: Tile[] = [];
@@ -190,7 +189,7 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
       if (focusPos && options.radius !== undefined && chebyshev(pos, focusPos) > options.radius) continue;
       const square = squareAt(map, pos)!;
       const rot = rotate(pos, map, rotation);
-      const tile = { pos, rot, terrain: square.terrain, elevation: square.elevation, token: byPos.get(`${x},${y}`) };
+      const tile = { pos, rot, terrain: square.terrain, elevation: square.elevation };
       tiles.push(tile);
       at.set(`${rot.x},${rot.y}`, tile);
     }
@@ -198,6 +197,16 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
   tiles.sort((a, b) => a.rot.x + a.rot.y - (b.rot.x + b.rot.y) || a.rot.x - b.rot.x);
 
   const labels = tokenLabels(creatures, options.focus);
+  // Creatures on visible squares. Two can share a square (one standing over a
+  // fallen one), so the fallen are drawn first and the standing on top.
+  const fallen = (id: string) => Number(!creatures.find((c) => c.id === id)?.down);
+  const tokens = [...map.tokens]
+    .flatMap(([id, p]) => {
+      const rot = rotate(p, map, rotation);
+      const tile = at.get(`${rot.x},${rot.y}`);
+      return tile ? [{ id, tile }] : [];
+    })
+    .sort((a, b) => fallen(a.id) - fallen(b.id));
   const scene: Scene = {
     tiles,
     at: (u, v) => at.get(`${u},${v}`),
@@ -207,10 +216,7 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
     rowsPerStep: options.rowsPerStep ?? 2,
     mid: options.ascii ? "-" : "·",
     backdrop: Math.round(((options.backdrop ?? 15) / 5) * (options.rowsPerStep ?? 2)),
-    figures: tiles
-      .filter((t) => t.token)
-      .map((t): Figure => {
-        const id = t.token!;
+    figures: tokens.map(({ id, tile: t }): Figure => {
         const c = creatures.find((k) => k.id === id);
         const label = labels.get(id) ?? "?";
         const m = options.motion?.get(id);
@@ -220,6 +226,7 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
           label,
           color: figureColor(c, label),
           down: !!c?.down,
+          dead: !!c?.dead,
           to: t.rot,
           from:
             m && fromSquare && !c?.down && m.progress < 1
@@ -247,7 +254,7 @@ export function renderIsometric(map: BattleMap, creatures: readonly Creature[], 
 
   // Legend: the viewer first, then other visible creatures in creature order.
   const legend: string[] = [];
-  const visible = new Map(tiles.filter((t) => t.token).map((t) => [t.token!, t]));
+  const visible = new Map(tokens.map(({ id, tile }) => [id, tile]));
   const ordered = [...creatures].sort((a, b) => Number(b.id === options.focus) - Number(a.id === options.focus));
   for (const c of ordered) {
     const t = visible.get(c.id);
@@ -441,7 +448,7 @@ function paint(scene: Scene): Canvas {
         for (let n = 0; n < text.length; n++) {
           if (text[n] === " ") continue;
           put(col + dc + n, row + dr, text[n]!, i, f.color);
-          if (isHead || f.label === "@") watched.push([col + dc + n, row + dr]);
+          if (!f.dead && (isHead || f.label === "@")) watched.push([col + dc + n, row + dr]);
         }
       };
       if (f.down) {

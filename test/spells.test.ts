@@ -174,7 +174,7 @@ describe("saving throw spells", () => {
       rng: scriptedRng([1, 20]),
     });
     enc.run();
-    assert.ok(enc.space.position("ogre") > 10, "the ogre ran away");
+    assert.ok(enc.space.distance("ogre", "caster") > 10, "the ogre ran away");
     assert.equal(kinds(enc.events, "attack-roll").length, 0);
     assert.equal(target.conditions.find((c) => c.slug === "frightened")?.value, 2, "frightened 3, down 1 at the end of its turn");
   });
